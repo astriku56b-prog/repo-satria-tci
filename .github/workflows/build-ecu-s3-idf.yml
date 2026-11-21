@@ -1,0 +1,29 @@
+name: Build ECU TCI S3 (ESP-IDF)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build_s3_ecu:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build ESP32-S3 Firmware
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          path: ecu_s3_idf
+          target: esp32s3
+          command: idf.py build
+
+      - name: Upload ECU .bin Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecu-tci-s3-v12-firmware
+          path: |
+            ecu_s3_idf/build/*.bin
+            ecu_s3_idf/build/bootloader/*.bin
+            ecu_s3_idf/build/partition_table/*.bin
