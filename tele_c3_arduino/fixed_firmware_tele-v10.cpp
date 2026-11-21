@@ -1,0 +1,1436 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_task_wdt.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncJson.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <LittleFS.h>
+#include "common_proto.h"
+
+// --- KONFIGURASI PIN UART ESP32-C3 (SESUAI JALUR PCB) ---
+#define RX_PIN 7        // Terhubung ke Pin 20 (TX_TELEMETRY) di ESP32-S3 ECU
+#define TX_PIN 6        // Terhubung ke Pin 19 (RX_TELEMETRY) di ESP32-S3 ECU
+#define WIFI_WAKE_PIN 9 // Tombol BOOT ESP32-C3 untuk menghidupkan ulang Wi-Fi AP jika timeout
+
+// --- MAC ADDRESS CUSTOM TRANSMITTER (C3) & DISPLAY HUD (S3) ---
+uint8_t transmitterMac[]    = {0x02, 0x53, 0x46, 0x55, 0x43, 0x33};
+uint8_t displayMacAddress[] = {0x02, 0x53, 0x46, 0x55, 0x48, 0x55};
+
+#define NUM_RPM_POINTS 15
+#define NUM_TPS_POINTS 5
+#define WDT_TIMEOUT_SEC 4
+Preferences preferences;
+AsyncWebServer server(80);
+
+// --- VARIABEL EFISIENSI & TIMEOUT WIFI (5 MENIT) ---
+unsigned long lastActivityTime = 0;
+const unsigned long WIFI_TIMEOUT_MS = 300000;
+bool isWifiActive = true;
+
+// --- STATUS KONEKSI UART & SINKRONISASI ---
+unsigned long lastUartRxTime = 0;
+const unsigned long UART_TIMEOUT_MS = 2000;
+bool isEcuConnected = false;
+bool initialSyncDone = false;
+bool pendingNvsSave = false;
+unsigned long lastSyncRetryTime = 0;
+uint8_t syncRetryCount = 0;
+portMUX_TYPE connMux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- ANTRIAN MODE CHANGE DARI HUD (DECOUPLED DARI ISR ESP-NOW) ---
+volatile bool pendingHudModeReq = false;
+volatile uint8_t pendingHudModeVal = 0;
+volatile uint8_t pendingHudSlotVal = 0;
+volatile uint8_t hudModeCmdStage = 0; // 0: idle, 1: kirim custom map dulu, 2: jeda 25ms lalu kirim mode
+unsigned long hudModeStageMs = 0;
+
+// --- DATA LOGGER CONFIGURATION (RAM RING BUFFER + PERIODIC FLASH SNAPSHOT) ---
+#define MAX_LOG_ENTRIES 800
+#define LOG_FILE_PATH   "/ecu_daily_log.csv"
+const unsigned long FAULT_FLASH_FLUSH_COOLDOWN_MS = 15000; // Simpan log ke flash otomatis hanya saat ada fault sensor/aki
+
+struct LogEntry {
+  uint32_t timestampMs;
+  uint16_t rpm;
+  uint8_t  tps;
+  int16_t  degree10;
+  int16_t  temp10;
+  uint16_t battVolt10;
+};
+
+LogEntry logBuffer[MAX_LOG_ENTRIES];
+uint16_t logHead = 0;
+uint16_t logCount = 0;
+uint16_t unsavedLogCount = 0;
+bool bufferOverflowed = false;
+bool fsReady = false;
+unsigned long lastFlashFlushMs = 0;
+portMUX_TYPE logMux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- DATA BAWAAN DEFAULT ---
+const int16_t mapDaily3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
+  {100, 100, 100, 100, 100}, {100, 100, 100, 100, 100}, {140, 150, 160, 170, 180},
+  {180, 200, 220, 230, 240}, {220, 240, 260, 270, 280}, {250, 270, 290, 300, 310},
+  {280, 300, 320, 330, 330}, {300, 320, 340, 350, 350}, {310, 330, 350, 350, 350},
+  {310, 330, 350, 350, 350}, {300, 320, 340, 340, 340}, {280, 300, 320, 320, 320},
+  {260, 280, 300, 300, 300}, {250, 250, 280, 280, 280}, {250, 250, 250, 250, 250}
+};
+
+const uint16_t defaultDwellPerRPM[NUM_RPM_POINTS] = {
+  3500, 3500, 3400, 3300, 3200, 3100, 3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200
+};
+
+struct CustomTuning {
+  int16_t mapData[NUM_RPM_POINTS][NUM_TPS_POINTS];
+  uint16_t dwellData[NUM_RPM_POINTS];
+  uint16_t rpmLimit;
+};
+CustomTuning customMapSlots[5];
+uint8_t currentActiveSlot = 0;
+portMUX_TYPE mapMux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- STRUKTUR PAKET KOMUNIKASI (100% SINKRON DENGAN ECU S3 IGNITION) ---
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t header;     // 0xAA55
+  uint16_t rpm;
+  uint8_t  tps;
+  int16_t  degree10;
+  int16_t  temp10;
+  uint16_t battVolt10;
+  uint8_t  mode;
+  uint8_t  fuel;
+  uint8_t  state;
+  uint8_t  ackStatus;
+  uint16_t faultCode;
+  uint16_t crc16;
+} TelemetryData;       // Total: 19 Bytes
+
+typedef struct {
+  uint16_t header;     // 0xCC55
+  uint8_t  requestedMode;
+  uint16_t crc16;
+} CommandData;         // Total: 5 Bytes
+
+typedef struct {
+  uint16_t header;                                  // 0x55CC
+  uint8_t  cmdType;                                 // 0x01: Mode, 0x02: RAM Map, 0x03: Save NVS, 0x04: Preload Sync
+  uint8_t  slotOrMode;
+  int16_t  mapData[NUM_RPM_POINTS][NUM_TPS_POINTS]; // 150 Bytes
+  uint16_t dwellData[NUM_RPM_POINTS];               // 30 Bytes
+  uint16_t rpmLimit;                                // 2 Bytes
+  uint16_t crc16;                                   // 2 Bytes
+} CommandPacketToECU;                             // Total: 188 Bytes
+#pragma pack(pop)
+
+static_assert(sizeof(TelemetryData) == 19, "Ukuran TelemetryData harus 19 byte");
+static_assert(sizeof(CommandData) == 5, "Ukuran CommandData harus 5 byte");
+static_assert(sizeof(CommandPacketToECU) == 188, "Ukuran CommandPacketToECU harus 188 byte");
+
+portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
+TelemetryData currentTelemetry = {0xAA55, 0, 0, 100, 300, 126, 0, 0, 0, 0, 0, 0};
+
+uint16_t calculateCRC16(const uint8_t *data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x8000) crc = (crc << 1) ^ 0x1021; else crc <<= 1;
+    }
+  }
+  return crc;
+}
+
+void pushToLog(const TelemetryData *pkt) {
+  if (pkt->rpm < 400) return;
+  portENTER_CRITICAL(&logMux);
+  logBuffer[logHead] = (LogEntry){
+    .timestampMs = millis(),
+    .rpm = pkt->rpm,
+    .tps = pkt->tps,
+    .degree10 = pkt->degree10,
+    .temp10 = pkt->temp10,
+    .battVolt10 = pkt->battVolt10
+  };
+  logHead = (logHead + 1) % MAX_LOG_ENTRIES;
+  if (logCount < MAX_LOG_ENTRIES) {
+    logCount++;
+  } else {
+    bufferOverflowed = true;
+  }
+  if (unsavedLogCount < MAX_LOG_ENTRIES) {
+    unsavedLogCount++;
+  }
+  portEXIT_CRITICAL(&logMux);
+}
+
+void flushLogToLittleFS() {
+  if (!fsReady) return;
+  uint16_t toSave = 0;
+  portENTER_CRITICAL(&logMux);
+  toSave = unsavedLogCount;
+  portEXIT_CRITICAL(&logMux);
+  if (toSave == 0) return;
+
+  // Batasi ukuran file maksimal ~120 KB agar flash awet dan tidak penuh
+  if (LittleFS.exists(LOG_FILE_PATH)) {
+    File chk = LittleFS.open(LOG_FILE_PATH, "r");
+    if (chk && chk.size() > 120000) {
+      chk.close();
+      LittleFS.remove(LOG_FILE_PATH);
+    } else if (chk) {
+      chk.close();
+    }
+  }
+
+  bool writeHeader = !LittleFS.exists(LOG_FILE_PATH);
+  File f = LittleFS.open(LOG_FILE_PATH, "a");
+  if (!f) return;
+  if (writeHeader) {
+    f.println("Timestamp_ms,RPM,TPS_Pct,Adv_Deg,Temp_C,Batt_V");
+  }
+
+  LogEntry batch[32];
+  uint16_t countSnap = 0;
+  portENTER_CRITICAL(&logMux);
+  countSnap = (unsavedLogCount > 32) ? 32 : unsavedLogCount;
+  uint16_t startIdx = (logHead + MAX_LOG_ENTRIES - unsavedLogCount) % MAX_LOG_ENTRIES;
+  for (uint16_t i = 0; i < countSnap; i++) {
+    batch[i] = logBuffer[(startIdx + i) % MAX_LOG_ENTRIES];
+  }
+  unsavedLogCount -= countSnap;
+  portEXIT_CRITICAL(&logMux);
+
+  for (uint16_t i = 0; i < countSnap; i++) {
+    f.printf("%lu,%u,%u,%.1f,%.1f,%.1f\n",
+             batch[i].timestampMs, batch[i].rpm, batch[i].tps,
+             (float)batch[i].degree10 / 10.0f,
+             (float)batch[i].temp10 / 10.0f,
+             (float)batch[i].battVolt10 / 10.0f);
+  }
+  f.close();
+}
+
+void sendCommandToECU(uint8_t cmdType, uint8_t slotOrMode) {
+  CommandPacketToECU cmd;
+  cmd.header = 0x55CC;
+  cmd.cmdType = cmdType;
+  cmd.slotOrMode = slotOrMode;
+
+  if ((cmdType == 0x02 || cmdType == 0x03 || cmdType == 0x04) && slotOrMode < 5) {
+    portENTER_CRITICAL(&mapMux);
+    memcpy(cmd.mapData, customMapSlots[slotOrMode].mapData, sizeof(cmd.mapData));
+    memcpy(cmd.dwellData, customMapSlots[slotOrMode].dwellData, sizeof(cmd.dwellData));
+    cmd.rpmLimit = customMapSlots[slotOrMode].rpmLimit;
+    portEXIT_CRITICAL(&mapMux);
+  } else {
+    memset(cmd.mapData, 0, sizeof(cmd.mapData));
+    memcpy(cmd.dwellData, defaultDwellPerRPM, sizeof(defaultDwellPerRPM));
+    cmd.rpmLimit = 11500;
+  }
+
+  cmd.crc16 = calculateCRC16((uint8_t*)&cmd, sizeof(CommandPacketToECU) - sizeof(uint16_t));
+  Serial1.write((uint8_t*)&cmd, sizeof(CommandPacketToECU));
+}
+
+void parseUART() {
+  static uint8_t rxBuffer[sizeof(TelemetryData)];
+  static size_t rxIndex = 0;
+
+  while (Serial1.available()) {
+    uint8_t c = Serial1.read();
+    if (rxIndex == 0) { if (c == 0xAA) rxBuffer[rxIndex++] = c; continue; }
+    else if (rxIndex == 1) {
+      if (c == 0x55) rxBuffer[rxIndex++] = c; else rxIndex = (c == 0xAA) ? 1 : 0; continue;
+    }
+    rxBuffer[rxIndex++] = c;
+
+    if (rxIndex >= sizeof(TelemetryData)) {
+      TelemetryData *pkt = (TelemetryData*)rxBuffer;
+      if (pkt->crc16 == calculateCRC16(rxBuffer, sizeof(TelemetryData) - sizeof(uint16_t))) {
+        portENTER_CRITICAL(&dataMux);
+        memcpy(&currentTelemetry, pkt, sizeof(TelemetryData));
+        portEXIT_CRITICAL(&dataMux);
+
+        lastUartRxTime = millis();
+        portENTER_CRITICAL(&connMux);
+        if (!isEcuConnected) {
+          isEcuConnected = true;
+          initialSyncDone = false;
+          syncRetryCount = 0;
+          lastSyncRetryTime = 0;
+        }
+        if (!initialSyncDone && syncRetryCount > 0 && (pkt->ackStatus == 4 || pkt->ackStatus == 1)) {
+          initialSyncDone = true;
+        }
+        portEXIT_CRITICAL(&connMux);
+
+        pushToLog(pkt);
+        esp_now_send(displayMacAddress, rxBuffer, sizeof(TelemetryData));
+      }
+      rxIndex = 0;
+    }
+  }
+}
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+void OnEspNowSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {}
+void OnEspNowRecv(const esp_now_recv_info_t * esp_now_info, const uint8_t *incomingData, int len) {
+  const uint8_t *srcMac = (esp_now_info && esp_now_info->src_addr) ? esp_now_info->src_addr : nullptr;
+#else
+void OnEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+void OnEspNowRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  const uint8_t *srcMac = mac;
+#endif
+  if (!srcMac || !incomingData) return;
+  if (!protoMacEquals(srcMac, displayMacAddress)) return;
+
+  if (len == sizeof(CommandData)) {
+    const CommandData *cmd = reinterpret_cast<const CommandData*>(incomingData);
+    uint16_t calcCrc = calculateCRC16(incomingData, sizeof(CommandData) - sizeof(uint16_t));
+    if (cmd->header == 0xCC55 && cmd->crc16 == calcCrc && cmd->requestedMode <= 3) {
+      portENTER_CRITICAL(&mapMux);
+      uint8_t slotSnapshot = currentActiveSlot;
+      pendingHudModeVal = cmd->requestedMode;
+      pendingHudSlotVal = slotSnapshot;
+      pendingHudModeReq = true;
+      portEXIT_CRITICAL(&mapMux);
+    }
+  }
+}
+
+void processHudModeRequest() {
+  unsigned long nowMs = millis();
+  bool hasReq = false;
+  uint8_t reqMode = 0;
+  uint8_t reqSlot = 0;
+
+  portENTER_CRITICAL(&mapMux);
+  if (pendingHudModeReq) {
+    pendingHudModeReq = false;
+    hasReq = true;
+    reqMode = pendingHudModeVal;
+    reqSlot = pendingHudSlotVal;
+  }
+  portEXIT_CRITICAL(&mapMux);
+
+  if (hasReq) {
+    if (reqMode == 3) {
+      sendCommandToECU(0x02, reqSlot);
+      portENTER_CRITICAL(&mapMux);
+      pendingHudModeVal = reqMode;
+      hudModeCmdStage = 2;
+      hudModeStageMs = nowMs;
+      portEXIT_CRITICAL(&mapMux);
+    } else {
+      sendCommandToECU(0x01, reqMode);
+      portENTER_CRITICAL(&mapMux);
+      hudModeCmdStage = 0;
+      portEXIT_CRITICAL(&mapMux);
+    }
+  } else {
+    bool sendStage2 = false;
+    uint8_t stage2Mode = 0;
+    portENTER_CRITICAL(&mapMux);
+    if (hudModeCmdStage == 2 && (nowMs - hudModeStageMs) >= 55) {
+      sendStage2 = true;
+      stage2Mode = pendingHudModeVal;
+      hudModeCmdStage = 0;
+    }
+    portEXIT_CRITICAL(&mapMux);
+    if (sendStage2) {
+      sendCommandToECU(0x01, stage2Mode);
+    }
+  }
+}
+
+void loadMapFromNVS() {
+  preferences.begin("ecu_tuning", false);
+  currentActiveSlot = preferences.getUChar("activeSlot", 0);
+  if (currentActiveSlot > 4) currentActiveSlot = 0;
+
+  if (preferences.getBytesLength("customMaps") == sizeof(customMapSlots)) {
+    preferences.getBytes("customMaps", &customMapSlots, sizeof(customMapSlots));
+  } else {
+    for (int s = 0; s < 5; s++) {
+      customMapSlots[s].rpmLimit = 11500;
+      memcpy(customMapSlots[s].dwellData, defaultDwellPerRPM, sizeof(defaultDwellPerRPM));
+      memcpy(customMapSlots[s].mapData, mapDaily3DBase, sizeof(mapDaily3DBase));
+    }
+  }
+  preferences.end();
+}
+
+void saveMapToNVS() {
+  preferences.begin("ecu_tuning", false);
+  preferences.putUChar("activeSlot", currentActiveSlot);
+  preferences.putBytes("customMaps", &customMapSlots, sizeof(customMapSlots));
+  preferences.end();
+}
+
+const char* htmlUI = R"rawliteral(
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>PATAS KUDUS — S3 TCI TELEMETRY PRO</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:ital,wght@0,600;0,700;1,700&family=Orbitron:wght@600;800;900&display=swap');
+  :root {
+    --bg-dark: #06070a;
+    --bg-panel: #0e1118;
+    --bg-glass: rgba(18, 22, 32, 0.75);
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --accent-cyan: #00f0ff;
+    --accent-green: #00ff88;
+    --accent-amber: #ffb800;
+    --accent-red: #ff1e56;
+    --text-primary: #f4f6fb;
+    --text-dim: #7b849b;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: 'Chakra Petch', sans-serif;
+    background-color: var(--bg-dark);
+    background-image:
+      radial-gradient(circle at 50% 0%, rgba(0, 240, 255, 0.08) 0%, transparent 60%),
+      linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 100% 100%, 24px 24px, 24px 24px;
+    color: var(--text-primary);
+    margin: 0; padding: 0; overflow-x: hidden;
+  }
+
+  .marquee-strip {
+    background: linear-gradient(90deg, #ff1e56, #00f0ff, #00ff88, #ff1e56);
+    background-size: 300% 300%;
+    animation: gradientShift 8s ease infinite;
+    padding: 2px 0;
+  }
+  @keyframes gradientShift { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+  .marquee-inner { background: #000; overflow: hidden; white-space: nowrap; padding: 4px 0; }
+  .marquee-text {
+    display: inline-block; font-family: 'Orbitron', sans-serif; font-size: 11px; font-weight: 800;
+    color: var(--accent-green); text-transform: uppercase; animation: marqueeScroll 20s linear infinite;
+    letter-spacing: 2px; text-shadow: 0 0 8px rgba(0,255,136,0.6);
+  }
+  @keyframes marqueeScroll { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
+
+  .top-bar {
+    background: rgba(10, 12, 18, 0.95);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border-subtle);
+    padding: 10px 14px;
+    display: flex; justify-content: space-between; align-items: center;
+    position: sticky; top: 0; z-index: 50;
+  }
+  .brand { font-family: 'Orbitron', sans-serif; font-weight: 900; font-size: 13px; letter-spacing: 1px; color: #fff; display: flex; align-items: center; gap: 6px; }
+  .brand span { color: var(--accent-cyan); text-shadow: 0 0 10px rgba(0,240,255,0.6); }
+
+  .conn-pill {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 12px; border-radius: 20px; font-size: 10px; font-family: 'Orbitron', sans-serif; font-weight: 800;
+    background: rgba(255, 30, 86, 0.15); border: 1px solid var(--accent-red); color: var(--accent-red);
+    transition: all 0.4s ease;
+  }
+  .conn-pill.online {
+    background: rgba(0, 255, 136, 0.15); border-color: var(--accent-green); color: var(--accent-green);
+    box-shadow: 0 0 15px rgba(0,255,136,0.4);
+  }
+  .conn-dot {
+    width: 8px; height: 8px; border-radius: 50%; background: currentColor;
+    box-shadow: 0 0 10px currentColor; animation: radarPulse 1.5s infinite;
+  }
+  @keyframes radarPulse { 0% { transform: scale(0.95); opacity: 0.8; box-shadow: 0 0 0 0 rgba(255,30,86, 0.7); } 70% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 8px rgba(255,30,86, 0); } 100% { transform: scale(0.95); opacity: 0.8; box-shadow: 0 0 0 0 rgba(255,30,86, 0); } }
+  .conn-pill.online .conn-dot { animation: radarPulseGreen 1.5s infinite; }
+  @keyframes radarPulseGreen { 0% { box-shadow: 0 0 0 0 rgba(0,255,136, 0.7); } 70% { box-shadow: 0 0 0 8px rgba(0,255,136, 0); } 100% { box-shadow: 0 0 0 0 rgba(0,255,136, 0); } }
+
+  .container { max-width: 600px; margin: 0 auto; padding: 12px; }
+
+  .tab-pane { animation: fadeInScale 0.3s ease-in-out; }
+  @keyframes fadeInScale { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+  .fault-banner {
+    background: linear-gradient(90deg, rgba(255,30,86,0.3), rgba(255,30,86,0.1));
+    border-left: 4px solid var(--accent-red);
+    color: #ff6b8b; padding: 10px 12px; border-radius: 8px; margin-bottom: 12px;
+    font-family: 'Orbitron', sans-serif; font-size: 11px; display: none; font-weight: 700;
+    animation: pulseAlert 1.2s infinite;
+  }
+  @keyframes pulseAlert { 50% { opacity: 0.5; } }
+
+  .nav-tabs {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+    background: var(--bg-panel); padding: 5px; border-radius: 12px;
+    border: 1px solid var(--border-subtle); margin-bottom: 14px;
+  }
+  .nav-btn {
+    background: transparent; border: none; color: var(--text-dim);
+    padding: 9px 4px; font-family: 'Orbitron', sans-serif; font-size: 10px; font-weight: 800;
+    border-radius: 8px; cursor: pointer; transition: all 0.25s ease; letter-spacing: 0.5px;
+  }
+  .nav-btn:hover { color: #fff; background: rgba(255,255,255,0.03); }
+  .nav-btn.active {
+    background: linear-gradient(135deg, rgba(0,240,255,0.25), rgba(0,255,136,0.2));
+    color: #fff; border: 1px solid rgba(0,240,255,0.5);
+    box-shadow: 0 0 15px rgba(0,240,255,0.2);
+  }
+
+  .card {
+    background: var(--bg-glass);
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px; padding: 14px; margin-bottom: 12px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    transition: transform 0.2s ease;
+  }
+
+  .tacho-wrapper { position: relative; width: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 4px 0; }
+  #tachoCanvas { width: 260px; height: 220px; display: block; filter: drop-shadow(0 0 10px rgba(0,240,255,0.15)); }
+  .shift-indicator {
+    position: absolute; top: 8px; right: 10px;
+    font-family: 'Orbitron', sans-serif; font-size: 9px; font-weight: 800;
+    padding: 4px 9px; border-radius: 6px; background: #161a24; color: var(--text-dim);
+    border: 1px solid var(--border-subtle); transition: all 0.1s;
+  }
+  .shift-indicator.flash { background: var(--accent-red); color: #fff; box-shadow: 0 0 20px var(--accent-red); border-color: #fff; transform: scale(1.05); }
+
+  .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  .metric-box {
+    background: var(--bg-panel); border: 1px solid var(--border-subtle);
+    border-radius: 12px; padding: 12px; position: relative; overflow: hidden;
+  }
+  .metric-label { font-size: 11px; color: var(--text-dim); font-weight: 700; letter-spacing: 1px; display: flex; justify-content: space-between; }
+  .metric-val { font-family: 'Orbitron', sans-serif; font-size: 22px; font-weight: 800; margin: 6px 0 8px 0; color: #fff; }
+  .metric-bar-bg { width: 100%; height: 6px; background: #1a1f2e; border-radius: 4px; overflow: hidden; }
+  .metric-bar-fill { height: 100%; width: 0%; border-radius: 4px; transition: width 0.1s linear, background-color 0.2s; }
+
+  .chart-header { font-family: 'Orbitron', sans-serif; font-size: 10px; color: var(--accent-cyan); letter-spacing: 1px; margin-bottom: 8px; display: flex; justify-content: space-between; }
+  canvas.graph { width: 100%; height: 155px; display: block; }
+
+  .controls-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  label.cfg-lbl { font-family: 'Orbitron', sans-serif; font-size: 9px; color: var(--text-dim); display: block; margin-bottom: 5px; letter-spacing: 1px; }
+  select, input.cfg {
+    width: 100%; background: #080a0f; color: var(--accent-cyan);
+    border: 1px solid rgba(255,255,255,0.12); padding: 10px;
+    font-family: 'Orbitron', sans-serif; font-size: 12px; font-weight: 700;
+    border-radius: 8px; outline: none; transition: border-color 0.2s;
+  }
+  select:focus, input.cfg:focus { border-color: var(--accent-cyan); box-shadow: 0 0 10px rgba(0,240,255,0.3); }
+
+  .quick-adj-bar { display: flex; gap: 6px; margin-bottom: 12px; background: var(--bg-panel); padding: 8px; border-radius: 10px; border: 1px solid var(--border-subtle); align-items: center; }
+  .btn-adj { flex: 1; background: #161b26; border: 1px solid rgba(0,240,255,0.3); color: var(--accent-cyan); font-family: 'Orbitron', sans-serif; font-weight: 800; font-size: 11px; padding: 8px 0; border-radius: 6px; cursor: pointer; transition: 0.2s; }
+  .btn-adj:active, .btn-adj:hover { background: var(--accent-cyan); color: #000; box-shadow: 0 0 10px rgba(0,240,255,0.4); }
+
+  .table-wrap { overflow-x: auto; max-height: 340px; border-radius: 10px; border: 1px solid var(--border-subtle); background: #090b10; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { border: 1px solid rgba(255,255,255,0.04); padding: 7px 4px; text-align: center; font-size: 13px; }
+  th { background: #121622; color: var(--accent-cyan); font-family: 'Orbitron', sans-serif; font-size: 10px; position: sticky; top: 0; z-index: 2; }
+
+  input.cell {
+    width: 44px; background: rgba(255,255,255,0.03); color: #fff;
+    border: 1px solid rgba(255,255,255,0.1); text-align: center; padding: 6px 2px;
+    font-family: 'Chakra Petch', sans-serif; font-weight: 700; font-size: 14px; border-radius: 6px; outline: none;
+    transition: transform 0.15s;
+  }
+  input.cell:focus { border-color: #fff; box-shadow: 0 0 10px rgba(255,255,255,0.5); transform: scale(1.08); background: rgba(0,240,255,0.15); }
+  input.dwell-cell { width: 85px; color: var(--accent-cyan); }
+
+  .btn-primary, .btn-danger, .btn-secondary {
+    position: relative; overflow: hidden; font-family: 'Orbitron', sans-serif; font-weight: 900;
+    border: none; padding: 14px; font-size: 12px; border-radius: 10px; cursor: pointer;
+    width: 100%; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 8px;
+    transition: filter 0.2s, transform 0.1s; display: block; text-align: center; text-decoration: none;
+  }
+  .btn-primary:active, .btn-danger:active, .btn-secondary:active { transform: scale(0.98); }
+
+  .btn-primary {
+    background: linear-gradient(135deg, #00f0ff, #0077ff); color: #000;
+    box-shadow: 0 4px 18px rgba(0, 240, 255, 0.35);
+  }
+  .btn-danger {
+    background: linear-gradient(135deg, #ff1e56, #ff5e00); color: #fff;
+    box-shadow: 0 4px 18px rgba(255, 30, 86, 0.35);
+  }
+  .btn-secondary {
+    background: #161b26; color: var(--text-primary); border: 1px solid var(--border-subtle); font-weight: 700; font-size: 11px; padding: 11px;
+  }
+
+  .btn-primary::after, .btn-danger::after {
+    content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%;
+    background: linear-gradient(60deg, transparent, rgba(255,255,255,0.25), transparent);
+    transform: rotate(30deg) translateX(-100%); animation: shimmerShine 3s infinite;
+  }
+  @keyframes shimmerShine { 0% { transform: rotate(30deg) translateX(-100%); } 20% { transform: rotate(30deg) translateX(100%); } 100% { transform: rotate(30deg) translateX(100%); } }
+
+  .tr-alert { background: rgba(255, 30, 86, 0.18) !important; color: #ff6b8b !important; }
+</style>
+</head>
+<body>
+
+<div class="marquee-strip">
+  <div class="marquee-inner">
+    <div class="marquee-text">🏁 TEAM PATAS KUDUS SATRIA CLUB &bull; ESP32-S3 IGNITION & TELEMETRY LIVE SYSTEM &bull; HIGH PERFORMANCE RACING TCI &bull; 🏁</div>
+  </div>
+</div>
+
+<div class="top-bar">
+  <div class="brand">⚡ PATAS KUDUS <span>S3 TCI</span></div>
+  <div class="conn-pill" id="connPill"><div class="conn-dot"></div><span id="ecuStatusText">MENCARI ECU...</span></div>
+</div>
+
+<div class="container">
+  <div id="faultBanner" class="fault-banner"></div>
+
+  <div class="nav-tabs">
+    <button class="nav-btn active" id="btnTabLive" onclick="switchMainTab('live')">COCKPIT</button>
+    <button class="nav-btn" id="btnTabDegree" onclick="switchMainTab('degree')">MAP 3D</button>
+    <button class="nav-btn" id="btnTabDwell" onclick="switchMainTab('dwell')">DWELL</button>
+    <button class="nav-btn" id="btnTabLogger" onclick="switchMainTab('logger')">LOGGER</button>
+  </div>
+
+  <!-- 1. COCKPIT / LIVE MONITOR -->
+  <div id="liveSection" class="tab-pane">
+    <div class="card tacho-wrapper">
+      <div class="shift-indicator" id="shiftLight">SHIFT LIMIT</div>
+      <canvas id="tachoCanvas" width="520" height="440"></canvas>
+    </div>
+
+    <div class="metric-grid">
+      <div class="metric-box">
+        <div class="metric-label"><span>IGNITION ADV</span><span>MAX 35&deg;</span></div>
+        <div class="metric-val" id="valDeg" style="color: var(--accent-green);">0.0&deg;</div>
+        <div class="metric-bar-bg"><div class="metric-bar-fill" id="barDeg" style="background: var(--accent-green);"></div></div>
+      </div>
+
+      <div class="metric-box">
+        <div class="metric-label"><span>THROTTLE (TPS)</span><span>0-100%</span></div>
+        <div class="metric-val" id="valTps" style="color: var(--accent-cyan);">0%</div>
+        <div class="metric-bar-bg"><div class="metric-bar-fill" id="barTps" style="background: var(--accent-cyan);"></div></div>
+      </div>
+
+      <div class="metric-box">
+        <div class="metric-label"><span>ENGINE TEMP</span><span>NTC</span></div>
+        <div class="metric-val" id="valTemp" style="color: var(--accent-amber);">0.0&deg;C</div>
+        <div class="metric-bar-bg"><div class="metric-bar-fill" id="barTemp" style="background: var(--accent-amber);"></div></div>
+      </div>
+
+      <div class="metric-box">
+        <div class="metric-label"><span>BATTERY</span><span>VOLT</span></div>
+        <div class="metric-val" id="valBatt" style="color: #c77dff;">0.0V</div>
+        <div class="metric-bar-bg"><div class="metric-bar-fill" id="barBatt" style="background: #c77dff;"></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="chart-header">
+        <span>LIVE TELEMETRY STREAM</span>
+        <span><span style="color:var(--accent-green);">&bull; RPM</span> &nbsp; <span style="color:var(--accent-cyan);">&bull; ADV&deg;</span></span>
+      </div>
+      <canvas id="realtimeChart" class="graph"></canvas>
+    </div>
+  </div>
+
+  <!-- 2. TUNING SECTION -->
+  <div id="tuningSection" class="tab-pane" style="display:none;">
+    <div class="card">
+      <div class="controls-grid">
+        <div>
+          <label class="cfg-lbl">PILIH SLOT MAP</label>
+          <select id="slotSelect" onchange="loadMap()">
+            <option value="0">SLOT 1 — DAILY / TOURING</option>
+            <option value="1">SLOT 2 — SPORT / KOPDAR</option>
+            <option value="2">SLOT 3 — RACING 150CC</option>
+            <option value="3">SLOT 4 — DRAG / EXTREME</option>
+            <option value="4">SLOT 5 — CUSTOM USER</option>
+          </select>
+        </div>
+        <div>
+          <label class="cfg-lbl">RPM LIMITER (1000-15000)</label>
+          <input type="number" id="rpmLimit" class="cfg" value="11500" min="1000" max="15000" step="100">
+        </div>
+      </div>
+    </div>
+
+    <div id="degTools">
+      <div class="quick-adj-bar">
+        <span style="font-size:10px; color:var(--text-dim); font-family:'Orbitron'; padding:0 4px;">KOREKSI:</span>
+        <button class="btn-adj" onclick="adjustSelectedCell(-10)">-1.0&deg;</button>
+        <button class="btn-adj" onclick="adjustSelectedCell(-5)">-0.5&deg;</button>
+        <button class="btn-adj" onclick="adjustSelectedCell(5)">+0.5&deg;</button>
+        <button class="btn-adj" onclick="adjustSelectedCell(10)">+1.0&deg;</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="chart-header"><span id="chartTitle">KURVA PENGAPIAN (DEGREE VS RPM)</span></div>
+      <canvas id="tuningChart" class="graph"></canvas>
+    </div>
+
+    <div id="tabDegree" class="table-wrap">
+      <table>
+        <thead><tr><th>RPM \ TPS</th><th>0%</th><th>25%</th><th>50%</th><th>75%</th><th>100%</th></tr></thead>
+        <tbody id="mapBody"></tbody>
+      </table>
+    </div>
+
+    <div id="tabDwell" class="table-wrap" style="display:none;">
+      <table>
+        <thead><tr><th>RPM AXIS</th><th>DWELL (&mu;s)</th><th>KARAKTER</th></tr></thead>
+        <tbody id="dwellBody"></tbody>
+      </table>
+    </div>
+
+    <button class="btn-danger" onclick="saveAndSend()">💾 SIMPAN & FLASH KE ECU S3</button>
+  </div>
+
+  <!-- 3. DATA LOGGER -->
+  <div id="loggerSection" class="tab-pane" style="display:none;">
+    <div class="card" style="text-align:center;">
+      <div id="overflowBadge" style="display:none; color:var(--accent-amber); font-size:11px; margin-bottom:10px; font-family:'Orbitron';">⚠️ BUFFER PENUH — LOG TERLAMA TERTIMPA</div>
+      <button class="btn-primary" onclick="fetchLiveDataLog()">🔄 REFRESH DATA LOG</button>
+      <a href="/downloadCSV" class="btn-secondary">📥 DOWNLOAD CSV (RAM)</a>
+      <a href="/downloadFlashCSV" class="btn-secondary">💾 DOWNLOAD CSV (FLASH HARIAN)</a>
+      <button class="btn-secondary" onclick="clearLogData()" style="color:var(--accent-red); border-color:rgba(255,30,86,0.3);">🗑️ HAPUS MEMORI LOG</button>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>WAKTU</th><th>RPM</th><th>TPS</th><th>ADV</th><th>SUHU</th><th>AKI</th></tr></thead>
+        <tbody id="logTableBody">
+          <tr><td colspan="6" style="color:var(--text-dim); padding:20px;">Klik Refresh Data Log untuk memuat rekaman.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const rpmLabels = ["0k","1k","2k","3k","4k","5k","6k","7k","8k","9k","10k","11k","12k","13k","14k"];
+let lastFocusedCell = null;
+
+let targetData  = { rpm: 0, deg: 0, tps: 0, temp: 0, batt: 12.6, limit: 11500 };
+let displayData = { rpm: 0, deg: 0, tps: 0, temp: 0, batt: 12.6 };
+
+let rtHistoryRpm = new Array(80).fill(0);
+let rtHistoryDeg = new Array(80).fill(0);
+let lastGraphPush = 0;
+
+function lerp(start, end, amt) {
+  return (1 - amt) * start + amt * end;
+}
+
+function renderLoop(timestamp) {
+  displayData.rpm  = lerp(displayData.rpm,  targetData.rpm,  0.22);
+  displayData.deg  = lerp(displayData.deg,  targetData.deg,  0.25);
+  displayData.tps  = lerp(displayData.tps,  targetData.tps,  0.28);
+  displayData.temp = lerp(displayData.temp, targetData.temp, 0.15);
+  displayData.batt = lerp(displayData.batt, targetData.batt, 0.15);
+
+  if (Math.abs(targetData.rpm - displayData.rpm) < 1) displayData.rpm = targetData.rpm;
+
+  if (document.getElementById('liveSection').style.display !== 'none') {
+    drawTachometer(displayData.rpm, targetData.limit);
+
+    document.getElementById('valDeg').innerText  = displayData.deg.toFixed(1) + '°';
+    document.getElementById('barDeg').style.width = Math.min(Math.max((displayData.deg / 35.0) * 100, 0), 100) + '%';
+
+    document.getElementById('valTps').innerText  = Math.round(displayData.tps) + '%';
+    document.getElementById('barTps').style.width = Math.min(Math.max(displayData.tps, 0), 100) + '%';
+
+    document.getElementById('valTemp').innerText = displayData.temp.toFixed(1) + '°C';
+    document.getElementById('barTemp').style.width = Math.min(Math.max((displayData.temp / 120.0) * 100, 0), 100) + '%';
+
+    document.getElementById('valBatt').innerText = displayData.batt.toFixed(1) + 'V';
+    let battPct = ((displayData.batt - 9.0) / 7.0) * 100;
+    document.getElementById('barBatt').style.width = Math.min(Math.max(battPct, 0), 100) + '%';
+
+    if (timestamp - lastGraphPush > 50) {
+      rtHistoryRpm.push(displayData.rpm);
+      rtHistoryDeg.push(displayData.deg);
+      rtHistoryRpm.shift();
+      rtHistoryDeg.shift();
+      drawRealtimeChart();
+      lastGraphPush = timestamp;
+    }
+  }
+  requestAnimationFrame(renderLoop);
+}
+requestAnimationFrame(renderLoop);
+
+function drawTachometer(rpm, limit) {
+  const canvas = document.getElementById('tachoCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const cx = w / 2, cy = h / 2 + 25;
+  const radius = 175;
+  const maxRpm = 15000;
+
+  ctx.clearRect(0, 0, w, h);
+
+  const startAngle = 0.75 * Math.PI;
+  const endAngle   = 2.25 * Math.PI;
+  const totalSweep = endAngle - startAngle;
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, startAngle, endAngle);
+  ctx.lineWidth = 26;
+  ctx.strokeStyle = '#151924';
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  let ratio = Math.min(Math.max(rpm / maxRpm, 0), 1);
+  let activeAngle = startAngle + ratio * totalSweep;
+  let isShift = rpm >= (limit - 400) && rpm > 2000;
+
+  let shiftEl = document.getElementById('shiftLight');
+  if (isShift) shiftEl.classList.add('flash');
+  else shiftEl.classList.remove('flash');
+
+  let grad = ctx.createLinearGradient(cx - radius, cy, cx + radius, cy);
+  if (isShift) {
+    grad.addColorStop(0, '#ff1e56');
+    grad.addColorStop(1, '#ff7b00');
+  } else {
+    grad.addColorStop(0, '#00f0ff');
+    grad.addColorStop(0.6, '#00ff88');
+    grad.addColorStop(1, '#ffb800');
+  }
+
+  if (rpm > 10) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, startAngle, activeAngle);
+    ctx.lineWidth = 26;
+    ctx.strokeStyle = grad;
+    ctx.lineCap = 'round';
+    ctx.shadowColor = isShift ? '#ff1e56' : '#00f0ff';
+    ctx.shadowBlur = 22;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.font = '700 18px Orbitron, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (let i = 0; i <= 15; i++) {
+    let a = startAngle + (i / 15) * totalSweep;
+    let tx = cx + Math.cos(a) * (radius - 38);
+    let ty = cy + Math.sin(a) * (radius - 38);
+    ctx.fillStyle = (i >= 12) ? '#ff1e56' : '#6c768f';
+    ctx.fillText(i.toString(), tx, ty);
+  }
+
+  ctx.fillStyle = isShift ? '#ff1e56' : '#ffffff';
+  ctx.font = '900 64px Orbitron, sans-serif';
+  ctx.fillText(Math.round(rpm).toString(), cx, cy - 8);
+
+  ctx.fillStyle = '#00f0ff';
+  ctx.font = '700 18px Orbitron, sans-serif';
+  ctx.fillText('RPM', cx, cy + 36);
+}
+
+function pollLiveStatus() {
+  fetch('/getLiveStatus').then(r => r.json()).then(data => {
+    let pill = document.getElementById('connPill');
+    let statusTxt = document.getElementById('ecuStatusText');
+    let faultEl = document.getElementById('faultBanner');
+
+    if (data.ecuOnline) {
+      pill.classList.add('online');
+      statusTxt.innerText = "ECU TERHUBUNG";
+    } else {
+      pill.classList.remove('online');
+      statusTxt.innerText = "MENCARI ECU...";
+    }
+
+    targetData.rpm  = data.rpm || 0;
+    targetData.deg  = (data.deg || 0) / 10.0;
+    targetData.tps  = data.tps || 0;
+    targetData.temp = (data.temp || 0) / 10.0;
+    targetData.batt = (data.batt || 0) / 10.0;
+    targetData.limit = parseInt(document.getElementById('rpmLimit').value) || 11500;
+
+    if (data.faultCode && data.faultCode !== 0) {
+      let msgs = [];
+      if (data.faultCode & 1) msgs.push("TPS SENSOR");
+      if (data.faultCode & 2) msgs.push("NTC TEMP");
+      if (data.faultCode & 4) msgs.push("LOW BATT (<10V)");
+      if (data.faultCode & 8) msgs.push("OVERCHARGE (>16V)");
+      if (data.faultCode & 16) msgs.push("NVS MEMORY ERR");
+      if (data.faultCode & 32) msgs.push("ADC SENSOR ERR");
+      faultEl.innerText = "⚠️ KENDALA: " + msgs.join(" • ");
+      faultEl.style.display = "block";
+    } else {
+      faultEl.style.display = "none";
+    }
+  }).catch(() => {});
+}
+setInterval(pollLiveStatus, 200);
+
+function drawRealtimeChart() {
+  const canvas = document.getElementById('realtimeChart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.clientWidth * 2;
+  canvas.height = canvas.clientHeight * 2;
+  const w = canvas.width, h = canvas.height;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 2;
+  for (let y = 0; y <= h; y += h / 4) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  let stepX = w / (rtHistoryRpm.length - 1);
+
+  ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 4; ctx.beginPath();
+  for (let i = 0; i < rtHistoryRpm.length; i++) {
+    let x = i * stepX;
+    let y = h - ((rtHistoryRpm[i] / 15000) * h);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle = '#00f0ff'; ctx.lineWidth = 3; ctx.beginPath();
+  for (let i = 0; i < rtHistoryDeg.length; i++) {
+    let x = i * stepX;
+    let y = h - ((rtHistoryDeg[i] / 35.0) * h);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function switchMainTab(tab) {
+  document.getElementById('liveSection').style.display    = (tab === 'live') ? 'block' : 'none';
+  document.getElementById('tuningSection').style.display  = (tab === 'degree' || tab === 'dwell') ? 'block' : 'none';
+  document.getElementById('loggerSection').style.display  = (tab === 'logger') ? 'block' : 'none';
+
+  ['btnTabLive', 'btnTabDegree', 'btnTabDwell', 'btnTabLogger'].forEach(id => document.getElementById(id).classList.remove('active'));
+
+  if (tab === 'live') {
+    document.getElementById('btnTabLive').classList.add('active');
+  } else if (tab === 'degree') {
+    document.getElementById('btnTabDegree').classList.add('active');
+    document.getElementById('tabDegree').style.display = 'block';
+    document.getElementById('tabDwell').style.display  = 'none';
+    document.getElementById('degTools').style.display  = 'block';
+    document.getElementById('chartTitle').innerText    = "KURVA PENGAPIAN (DEGREE VS RPM)";
+    drawChart();
+  } else if (tab === 'dwell') {
+    document.getElementById('btnTabDwell').classList.add('active');
+    document.getElementById('tabDegree').style.display = 'none';
+    document.getElementById('tabDwell').style.display  = 'block';
+    document.getElementById('degTools').style.display  = 'none';
+    document.getElementById('chartTitle').innerText    = "KURVA DWELL TIME (MICROSECONDS)";
+    drawChart();
+  } else if (tab === 'logger') {
+    document.getElementById('btnTabLogger').classList.add('active');
+    fetchLiveDataLog();
+  }
+}
+
+function applyHeatmapColors() {
+  for (let r = 0; r < 15; r++) {
+    for (let t = 0; t < 5; t++) {
+      let cell = document.getElementById(`c_${r}_${t}`);
+      if (!cell) continue;
+      let val = parseInt(cell.value) || 0;
+      let ratio = Math.min(Math.max((val - 100) / 250, 0), 1);
+      let hue = (1 - ratio) * 200;
+      cell.style.backgroundColor = `hsla(${hue}, 85%, 45%, 0.25)`;
+      cell.style.borderColor     = `hsla(${hue}, 90%, 55%, 0.6)`;
+      cell.style.color           = `hsl(${hue}, 100%, 75%)`;
+    }
+  }
+}
+
+function adjustSelectedCell(delta) {
+  if (!lastFocusedCell) { alert('Ketuk salah satu kotak angka pada tabel Map 3D terlebih dahulu.'); return; }
+  let val = (parseInt(lastFocusedCell.value) || 0) + delta;
+  lastFocusedCell.value = Math.min(Math.max(val, 0), 350);
+  drawChart();
+  applyHeatmapColors();
+}
+
+function drawChart() {
+  const canvas = document.getElementById('tuningChart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.clientWidth * 2;
+  canvas.height = canvas.clientHeight * 2;
+  const w = canvas.width, h = canvas.height;
+  const padL = 55, padR = 25, padT = 25, padB = 45;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 2;
+  ctx.fillStyle = '#7b849b'; ctx.font = '700 18px Orbitron, sans-serif';
+
+  let isDeg = document.getElementById('tabDegree').style.display !== 'none';
+  if (isDeg) {
+    let minY = 0, maxY = 350;
+    for (let v = 0; v <= 350; v += 50) {
+      let y = padT + plotH - ((v - minY) / (maxY - minY)) * plotH;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+      ctx.fillText((v / 10) + '°', 8, y + 6);
+    }
+    for (let r = 0; r < 15; r += 2) {
+      let x = padL + (r / 14) * plotW;
+      ctx.fillText(rpmLabels[r], x - 14, h - 12);
+    }
+    const colors = ['#00f0ff', '#00ff88', '#ffb800', '#ff7b00', '#ff1e56'];
+    for (let t = 0; t < 5; t++) {
+      ctx.strokeStyle = colors[t]; ctx.lineWidth = 4; ctx.beginPath();
+      for (let r = 0; r < 15; r++) {
+        let el = document.getElementById(`c_${r}_${t}`);
+        let val = el ? (parseInt(el.value) || 0) : 100;
+        let x = padL + (r / 14) * plotW;
+        let y = padT + plotH - ((val - minY) / (maxY - minY)) * plotH;
+        if (r === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  } else {
+    let minY = 1000, maxY = 6000;
+    for (let v = 1000; v <= 6000; v += 1000) {
+      let y = padT + plotH - ((v - minY) / (maxY - minY)) * plotH;
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+      ctx.fillText((v / 1000) + 'k', 8, y + 6);
+    }
+    for (let r = 0; r < 15; r += 2) {
+      let x = padL + (r / 14) * plotW;
+      ctx.fillText(rpmLabels[r], x - 14, h - 12);
+    }
+    ctx.strokeStyle = '#00f0ff'; ctx.lineWidth = 5; ctx.beginPath();
+    for (let r = 0; r < 15; r++) {
+      let el = document.getElementById(`d_${r}`);
+      let val = el ? (parseInt(el.value) || 3200) : 3200;
+      let x = padL + (r / 14) * plotW;
+      let y = padT + plotH - ((val - minY) / (maxY - minY)) * plotH;
+      if (r === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+}
+
+function loadMap() {
+  let slot = document.getElementById('slotSelect').value;
+  fetch('/getMap?slot=' + slot).then(r => r.json()).then(data => {
+    document.getElementById('rpmLimit').value = data.rpmLimit;
+    let tbodyMap = document.getElementById('mapBody'); tbodyMap.innerHTML = '';
+    for (let r = 0; r < 15; r++) {
+      let tr = document.createElement('tr');
+      let tdRpm = document.createElement('td');
+      tdRpm.style.color = '#00f0ff'; tdRpm.style.fontWeight = '700'; tdRpm.innerText = rpmLabels[r];
+      tr.appendChild(tdRpm);
+      for (let t = 0; t < 5; t++) {
+        let td = document.createElement('td');
+        let val = (data.map && data.map[r]) ? data.map[r][t] : 100;
+        td.innerHTML = `<input type="number" class="cell" id="c_${r}_${t}" min="0" max="350" value="${val}" onfocus="lastFocusedCell=this" oninput="drawChart(); applyHeatmapColors();">`;
+        tr.appendChild(td);
+      }
+      tbodyMap.appendChild(tr);
+    }
+
+    let tbodyDwell = document.getElementById('dwellBody'); tbodyDwell.innerHTML = '';
+    for (let r = 0; r < 15; r++) {
+      let tr = document.createElement('tr');
+      let tdRpm = document.createElement('td'); tdRpm.style.color = '#00f0ff'; tdRpm.innerText = rpmLabels[r] + ' RPM';
+      let tdDwell = document.createElement('td');
+      let dVal = (data.dwell && data.dwell[r]) ? data.dwell[r] : 3200;
+      tdDwell.innerHTML = `<input type="number" class="cell dwell-cell" id="d_${r}" min="1000" max="6000" value="${dVal}" step="50" oninput="drawChart()">`;
+      let tdDesc = document.createElement('td'); tdDesc.style.color = '#7b849b'; tdDesc.style.fontSize = '11px';
+      tdDesc.innerText = r < 4 ? 'Low Charge' : (r < 10 ? 'Mid Optimal' : 'High Speed');
+      tr.appendChild(tdRpm); tr.appendChild(tdDwell); tr.appendChild(tdDesc);
+      tbodyDwell.appendChild(tr);
+    }
+    drawChart();
+    applyHeatmapColors();
+  });
+}
+
+function saveAndSend() {
+  let slot = parseInt(document.getElementById('slotSelect').value);
+  let limitVal = Math.min(Math.max(parseInt(document.getElementById('rpmLimit').value) || 11500, 1000), 15000);
+  document.getElementById('rpmLimit').value = limitVal;
+
+  let payload = { slot: slot, rpmLimit: limitVal, map: [], dwell: [] };
+  for (let r = 0; r < 15; r++) {
+    let row = [];
+    for (let t = 0; t < 5; t++) {
+      let v = Math.min(Math.max(parseInt(document.getElementById(`c_${r}_${t}`).value) || 100, 0), 350);
+      document.getElementById(`c_${r}_${t}`).value = v;
+      row.push(v);
+    }
+    payload.map.push(row);
+  }
+  for (let r = 0; r < 15; r++) {
+    let dv = Math.min(Math.max(parseInt(document.getElementById(`d_${r}`).value) || 3200, 1000), 6000);
+    document.getElementById(`d_${r}`).value = dv;
+    payload.dwell.push(dv);
+  }
+  drawChart();
+  applyHeatmapColors();
+
+  fetch('/saveTuning', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) })
+  .then(() => alert('✅ Slot ' + (slot + 1) + ' Berhasil Tersimpan & Aktif di ECU S3!'));
+}
+
+function fetchLiveDataLog() {
+  fetch('/getLogData').then(r => r.json()).then(data => {
+    let tbody = document.getElementById('logTableBody');
+    tbody.innerHTML = '';
+    document.getElementById('overflowBadge').style.display = data.overflow ? 'block' : 'none';
+    if (!data.logs || data.logs.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-dim); padding:16px;">Belum ada data terekam.</td></tr>';
+      return;
+    }
+    data.logs.reverse().forEach(e => {
+      let tr = document.createElement('tr');
+      if ((e.temp / 10.0) >= 95.0 || (e.batt / 10.0) < 11.5 || (e.batt / 10.0) > 15.5) tr.classList.add('tr-alert');
+      tr.innerHTML = `
+        <td style="color:var(--text-dim);">${(e.t / 1000).toFixed(1)}s</td>
+        <td style="color:var(--accent-green); font-weight:700;">${e.r}</td>
+        <td>${e.p}%</td>
+        <td style="color:var(--accent-cyan);">${(e.a / 10).toFixed(1)}°</td>
+        <td>${(e.temp / 10).toFixed(1)}°</td>
+        <td>${(e.batt / 10).toFixed(1)}V</td>`;
+      tbody.appendChild(tr);
+    });
+  }).catch(() => {});
+}
+
+function clearLogData() {
+  if (confirm('Hapus seluruh riwayat log di RAM & Flash?')) {
+    fetch('/clearLog').then(() => fetchLiveDataLog());
+  }
+}
+
+window.onload = function() {
+  fetch('/getLiveStatus').then(r => r.json()).then(d => {
+    document.getElementById('slotSelect').value = d.activeSlot;
+    loadMap();
+  }).catch(() => loadMap());
+};
+window.onresize = function() { drawChart(); };
+</script>
+</body>
+</html>
+)rawliteral";
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastActivityTime = millis();
+    request->send_P(200, "text/html", htmlUI);
+  });
+
+  server.on("/getLiveStatus", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastActivityTime = millis();
+    JsonDocument doc;
+
+    portENTER_CRITICAL(&dataMux);
+    doc["rpm"] = currentTelemetry.rpm;
+    doc["tps"] = currentTelemetry.tps;
+    doc["deg"] = currentTelemetry.degree10;
+    doc["temp"] = currentTelemetry.temp10;
+    doc["batt"] = currentTelemetry.battVolt10;
+    doc["faultCode"] = currentTelemetry.faultCode;
+    doc["ackStatus"] = currentTelemetry.ackStatus;
+    portEXIT_CRITICAL(&dataMux);
+
+    portENTER_CRITICAL(&connMux);
+    bool ecuOnlineSnap = isEcuConnected;
+    portEXIT_CRITICAL(&connMux);
+    portENTER_CRITICAL(&mapMux);
+    uint8_t activeSlotSnap = currentActiveSlot;
+    portEXIT_CRITICAL(&mapMux);
+    doc["ecuOnline"] = ecuOnlineSnap;
+    doc["activeSlot"] = activeSlotSnap;
+
+    String resp;
+    serializeJson(doc, resp);
+    request->send(200, "application/json", resp);
+  });
+
+  server.on("/getMap", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastActivityTime = millis();
+    uint8_t slot = request->hasParam("slot") ? request->getParam("slot")->value().toInt() : 0;
+    if (slot > 4) slot = 0;
+    CustomTuning snapSlot;
+    portENTER_CRITICAL(&mapMux);
+    snapSlot = customMapSlots[slot];
+    portEXIT_CRITICAL(&mapMux);
+
+    JsonDocument doc;
+    doc["rpmLimit"] = snapSlot.rpmLimit;
+    JsonArray arrMap = doc["map"].to<JsonArray>();
+    for (int r = 0; r < NUM_RPM_POINTS; r++) {
+      JsonArray row = arrMap.add<JsonArray>();
+      for (int t = 0; t < NUM_TPS_POINTS; t++) row.add(snapSlot.mapData[r][t]);
+    }
+    JsonArray arrDwell = doc["dwell"].to<JsonArray>();
+    for (int r = 0; r < NUM_RPM_POINTS; r++) arrDwell.add(snapSlot.dwellData[r]);
+    String response; serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  server.on("/getLogData", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastActivityTime = millis();
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    JsonDocument doc;
+    doc["overflow"] = bufferOverflowed;
+
+    JsonArray arr = doc["logs"].to<JsonArray>();
+    portENTER_CRITICAL(&logMux);
+    uint16_t startIdx = (logCount < MAX_LOG_ENTRIES) ? 0 : logHead;
+    for (uint16_t i = 0; i < logCount; i++) {
+      uint16_t idx = (startIdx + i) % MAX_LOG_ENTRIES;
+      JsonObject entry = arr.add<JsonObject>();
+      entry["t"] = logBuffer[idx].timestampMs;
+      entry["r"] = logBuffer[idx].rpm;
+      entry["p"] = logBuffer[idx].tps;
+      entry["a"] = logBuffer[idx].degree10;
+      entry["temp"] = logBuffer[idx].temp10;
+      entry["batt"] = logBuffer[idx].battVolt10;
+    }
+    portEXIT_CRITICAL(&logMux);
+    serializeJson(doc, *response);
+    request->send(response);
+  });
+
+  server.on("/clearLog", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastActivityTime = millis();
+    portENTER_CRITICAL(&logMux);
+    logHead = 0; logCount = 0; unsavedLogCount = 0; bufferOverflowed = false;
+    portEXIT_CRITICAL(&logMux);
+    if (fsReady && LittleFS.exists(LOG_FILE_PATH)) {
+      LittleFS.remove(LOG_FILE_PATH);
+    }
+    request->send(200, "text/plain", "Log Cleared");
+  });
+
+  server.on("/downloadCSV", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastActivityTime = millis();
+    AsyncResponseStream *response = request->beginResponseStream("text/csv");
+    response->addHeader("Content-Disposition", "attachment; filename=satria_ecu_ram_log.csv");
+    response->print("Timestamp_ms,RPM,TPS_Pct,Adv_Deg,Temp_C,Batt_V\n");
+    portENTER_CRITICAL(&logMux);
+    uint16_t startIdx = (logCount < MAX_LOG_ENTRIES) ? 0 : logHead;
+    for (uint16_t i = 0; i < logCount; i++) {
+      uint16_t idx = (startIdx + i) % MAX_LOG_ENTRIES;
+      response->printf("%lu,%u,%u,%.1f,%.1f,%.1f\n",
+                       logBuffer[idx].timestampMs, logBuffer[idx].rpm, logBuffer[idx].tps,
+                       (float)logBuffer[idx].degree10 / 10.0f,
+                       (float)logBuffer[idx].temp10 / 10.0f,
+                       (float)logBuffer[idx].battVolt10 / 10.0f);
+    }
+    portEXIT_CRITICAL(&logMux);
+    request->send(response);
+  });
+
+  server.on("/downloadFlashCSV", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastActivityTime = millis();
+    flushLogToLittleFS();
+    if (fsReady && LittleFS.exists(LOG_FILE_PATH)) {
+      request->send(LittleFS, LOG_FILE_PATH, "text/csv", true);
+    } else {
+      request->send(404, "text/plain", "Belum ada file log di flash.");
+    }
+  });
+
+  AsyncCallbackJsonWebHandler* handler = new AsyncCallbackJsonWebHandler("/saveTuning", [](AsyncWebServerRequest *request, JsonVariant &json) {
+    lastActivityTime = millis();
+    JsonObject obj = json.as<JsonObject>();
+    uint8_t slot = obj["slot"].as<uint8_t>();
+    if (slot > 4) slot = 0;
+
+    uint16_t newLimit = constrain(obj["rpmLimit"].as<uint16_t>(), 1000, 15000);
+    int16_t tempMap[NUM_RPM_POINTS][NUM_TPS_POINTS];
+    uint16_t tempDwell[NUM_RPM_POINTS];
+
+    portENTER_CRITICAL(&mapMux);
+    memcpy(tempMap, customMapSlots[slot].mapData, sizeof(tempMap));
+    memcpy(tempDwell, customMapSlots[slot].dwellData, sizeof(tempDwell));
+    portEXIT_CRITICAL(&mapMux);
+
+    JsonArray arrMap = obj["map"].as<JsonArray>(); int r = 0;
+    for(JsonVariant row : arrMap) {
+      if(r >= NUM_RPM_POINTS) break; int t = 0;
+      for(JsonVariant val : row.as<JsonArray>()) {
+        if(t >= NUM_TPS_POINTS) break;
+        tempMap[r][t] = constrain(val.as<int16_t>(), 0, 350);
+        t++;
+      } r++;
+    }
+    JsonArray arrDwell = obj["dwell"].as<JsonArray>(); int d = 0;
+    for(JsonVariant val : arrDwell) {
+      if(d >= NUM_RPM_POINTS) break;
+      tempDwell[d] = constrain(val.as<uint16_t>(), 1000, 6000);
+      d++;
+    }
+
+    portENTER_CRITICAL(&mapMux);
+    currentActiveSlot = slot;
+    customMapSlots[slot].rpmLimit = newLimit;
+    memcpy(customMapSlots[slot].mapData, tempMap, sizeof(tempMap));
+    memcpy(customMapSlots[slot].dwellData, tempDwell, sizeof(tempDwell));
+    portEXIT_CRITICAL(&mapMux);
+    portENTER_CRITICAL(&connMux);
+    pendingNvsSave = true;
+    portEXIT_CRITICAL(&connMux);
+    sendCommandToECU(0x03, slot);
+    request->send(200, "text/plain", "Saved & Sent");
+    lastActivityTime = millis();
+  });
+
+  server.addHandler(handler);
+  server.begin();
+}
+
+void startWifiAccessPoint() {
+  WiFi.mode(WIFI_AP_STA);
+  esp_wifi_set_mac(WIFI_IF_STA, transmitterMac);
+  WiFi.softAP("ECU_SATRIA_FU", "kudus1234", 1);
+  esp_wifi_set_max_tx_power(50);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  isWifiActive = true;
+  lastActivityTime = millis();
+}
+
+void setup() {
+  // Gunakan 160 MHz agar AsyncWebServer + JSON + ESP-NOW + UART 250kbps berjalan tanpa bottleneck
+  setCpuFrequencyMhz(160);
+  pinMode(WIFI_WAKE_PIN, INPUT_PULLUP);
+  Serial1.begin(250000, SERIAL_8N1, RX_PIN, TX_PIN);
+
+  fsReady = LittleFS.begin(true);
+
+  startWifiAccessPoint();
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_send_cb(OnEspNowSent);
+    esp_now_register_recv_cb(OnEspNowRecv);
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, displayMacAddress, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+
+    uint8_t bcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_peer_info_t bcastPeer = {};
+    memcpy(bcastPeer.peer_addr, bcastMac, 6);
+    bcastPeer.channel = 1;
+    bcastPeer.encrypt = false;
+    esp_now_add_peer(&bcastPeer);
+  }
+
+  loadMapFromNVS();
+  setupWebServer();
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  esp_task_wdt_config_t wdtCfg = {
+    .timeout_ms     = WDT_TIMEOUT_SEC * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic  = true
+  };
+  esp_task_wdt_init(&wdtCfg);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+#endif
+  esp_task_wdt_add(NULL);
+
+  lastActivityTime = millis();
+  lastFlashFlushMs = millis();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  parseUART();
+  processHudModeRequest();
+
+  bool doNvsSave = false;
+  portENTER_CRITICAL(&connMux);
+  if (pendingNvsSave) {
+    pendingNvsSave = false;
+    doNvsSave = true;
+  }
+  portEXIT_CRITICAL(&connMux);
+  if (doNvsSave) {
+    saveMapToNVS();
+  }
+
+  bool needSync = false;
+  uint8_t slotToSync = 0;
+  portENTER_CRITICAL(&connMux);
+  if (isEcuConnected && !initialSyncDone && (millis() - lastSyncRetryTime > 600)) {
+    needSync = true;
+    lastSyncRetryTime = millis();
+    syncRetryCount++;
+    if (syncRetryCount >= 3) {
+      initialSyncDone = true;
+    }
+  }
+  portEXIT_CRITICAL(&connMux);
+
+  if (needSync) {
+    portENTER_CRITICAL(&mapMux);
+    slotToSync = currentActiveSlot;
+    portEXIT_CRITICAL(&mapMux);
+    sendCommandToECU(0x04, slotToSync);
+  }
+
+  bool timedOut = false;
+  portENTER_CRITICAL(&connMux);
+  if (isEcuConnected && (millis() - lastUartRxTime > UART_TIMEOUT_MS)) {
+    isEcuConnected = false;
+    initialSyncDone = false;
+    syncRetryCount = 0;
+    timedOut = true;
+  }
+  portEXIT_CRITICAL(&connMux);
+
+  if (timedOut) {
+    portENTER_CRITICAL(&dataMux);
+    currentTelemetry.rpm = 0;
+    currentTelemetry.tps = 0;
+    currentTelemetry.state = 0;
+    currentTelemetry.ackStatus = 0;
+    portEXIT_CRITICAL(&dataMux);
+    flushLogToLittleFS();
+  }
+
+  uint16_t snapFault = 0;
+  portENTER_CRITICAL(&dataMux);
+  snapFault = currentTelemetry.faultCode;
+  portEXIT_CRITICAL(&dataMux);
+  if (snapFault != 0 && (millis() - lastFlashFlushMs) >= FAULT_FLASH_FLUSH_COOLDOWN_MS) {
+    lastFlashFlushMs = millis();
+    flushLogToLittleFS();
+  }
+
+  // Tekan tombol BOOT (GPIO 9) pada C3 untuk mengaktifkan kembali Wi-Fi AP setelah timeout
+  if (!isWifiActive && digitalRead(WIFI_WAKE_PIN) == LOW) {
+    startWifiAccessPoint();
+    server.begin();
+  }
+
+  if (isWifiActive && (millis() - lastActivityTime > WIFI_TIMEOUT_MS)) {
+    flushLogToLittleFS();
+    server.end();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    isWifiActive = false;
+  }
+
+  delay(1);
+}
