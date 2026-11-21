@@ -67,7 +67,12 @@ static const char *TAG = "ECU_TCI";
 #define SENSOR_FAULT_MASK  (FAULT_TPS_OUT | FAULT_NTC_OUT | FAULT_BATT_LOW | FAULT_BATT_HIGH | FAULT_ADC_ERR)
 
 #define ABS_VAL(x)         ((x) < 0 ? -(x) : (x))
-#define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
+static inline int64_t clamp_i64(int64_t x, int64_t min_v, int64_t max_v) {
+    if (x < min_v) return min_v;
+    if (x > max_v) return max_v;
+    return x;
+}
+#define CLAMP(x, min, max) ((__typeof__(x))clamp_i64((int64_t)(x), (int64_t)(min), (int64_t)(max)))
 #define INV_3600_Q32       1193046ULL
 #define MAX_DWELL_US       6000U
 
