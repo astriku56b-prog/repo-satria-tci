@@ -48,7 +48,7 @@ static const char *TAG = "ECU_TCI";
 
 #define ADC_CHAN_TPS     ADC_CHANNEL_0  // GPIO 1 (ADC1)
 #define ADC_CHAN_TEMP    ADC_CHANNEL_1  // GPIO 2 (ADC1)
-#define ADC_CHAN_BATT    ADC_CHANNEL_3  // GPIO 4 (ADC1) - pengganti GPIO 3
+#define ADC_CHAN_BATT    ADC_CHANNEL_3  // GPIO 4 (ADC1)
 
 #define WDT_TIMEOUT_MS         600
 #define NVS_NAMESPACE          "ecu_tci_cfg"
@@ -1158,10 +1158,3 @@ void app_main(void) {
 
   ESP_ERROR_CHECK(esp_task_wdt_delete(NULL));
 }
-```[cite: 1]
-
-### Ringkasan Perubahan
-* **`ADC_CHAN_BATT`:** Diubah dari `ADC_CHANNEL_2` (**GPIO 3**) menjadi `ADC_CHANNEL_3` (**GPIO 4**)[cite: 1].
-* **Konfigurasi lainnya:** Seluruh logika pengapian, *timer*, *interrupt pulser*, NVS, *telemetry/command* UART, serta pemetaan ADC (`battVolt10`) tetap dipertahankan[cite: 1].
-
-Apakah Anda ingin saya bantu menghitung nilai resistor *voltage divider* untuk jalur aki ke **GPIO 4**?
