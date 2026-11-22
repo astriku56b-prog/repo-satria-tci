@@ -31,6 +31,15 @@ jobs:
           arduino-cli core install esp32:esp32@3.1.1
           arduino-cli lib install "ArduinoJson" "ESPAsyncWebServer" "AsyncTCP" "LovyanGFX" "RTClib" "Adafruit Fingerprint Sensor Library" "ChronosESP32"
 
+      - name: Patch ESPAsyncWebServer mbedTLS MD5 for IDF v5.3
+        run: |
+          AUTH_FILE="$HOME/Arduino/libraries/ESPAsyncWebServer/src/WebAuthentication.cpp"
+          if [ -f "$AUTH_FILE" ]; then
+            sed -i 's/mbedtls_md5_starts_ret(/mbedtls_md5_starts(/g' "$AUTH_FILE"
+            sed -i 's/mbedtls_md5_update_ret(/mbedtls_md5_update(/g' "$AUTH_FILE"
+            sed -i 's/mbedtls_md5_finish_ret(/mbedtls_md5_finish(/g' "$AUTH_FILE"
+          fi
+
       - name: Compile Telemetry C3 (v10)
         run: |
           mkdir -p out/tele_c3
