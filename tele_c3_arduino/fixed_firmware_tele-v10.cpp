@@ -277,11 +277,17 @@ void parseUART() {
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-void OnEspNowSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {}
+void OnEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  (void)mac_addr;
+  (void)status;
+}
 void OnEspNowRecv(const esp_now_recv_info_t * esp_now_info, const uint8_t *incomingData, int len) {
   const uint8_t *srcMac = (esp_now_info && esp_now_info->src_addr) ? esp_now_info->src_addr : nullptr;
 #else
-void OnEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+void OnEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  (void)mac_addr;
+  (void)status;
+}
 void OnEspNowRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   const uint8_t *srcMac = mac;
 #endif
