@@ -45,6 +45,35 @@ jobs:
           mkdir -p out/tele_c3
           arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc --export-binaries --output-dir out/tele_c3 tele_c3_arduino
 
+      - name: Patch HUD S3 v23 for Core 3.1.1 Compatibility
+        run: |
+          python3 - <<'EOF'
+          from pathlib import Path
+
+          p = Path("hud_s3_arduino/fixed_firmware_Satria_HUD_Fixed-v23.cpp")
+          src = p.read_text(encoding="utf-8")
+
+          src = src.replace(
+              "#include <ChronosESP32.h>",
+              "#define DateTime ChronosDateTime\n#include <ChronosESP32.h>\n#undef DateTime",
+              1,
+          )
+
+          if "void triggerPopup(" not in src and "void setSeatRelayHold(" in src:
+              src = src.replace(
+                  "void setSeatRelayHold(",
+                  "void triggerPopup(const char* title, const char* subtitle, uint16_t color, uint32_t durationMs);\nvoid setSeatRelayHold(",
+                  1,
+              )
+
+          src = src.replace(
+              "void onTciEspNowSent(const wifi_tx_info_t *info, esp_now_send_status_t status)",
+              "void onTciEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status)",
+          )
+
+          p.write_text(src, encoding="utf-8")
+          EOF
+
       - name: Compile HUD S3 (v23)
         run: |
           mkdir -p out/hud_s3
