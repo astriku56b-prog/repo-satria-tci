@@ -16,7 +16,12 @@ jobs:
       - name: Install Arduino CLI
         run: |
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          echo "$HOME/bin" >> $GITHUB_PATH
+          if [ -f "./bin/arduino-cli" ]; then
+            sudo mv ./bin/arduino-cli /usr/local/bin/
+          elif [ -f "$HOME/bin/arduino-cli" ]; then
+            sudo mv "$HOME/bin/arduino-cli" /usr/local/bin/
+          fi
+          arduino-cli version
 
       - name: Configure ESP32 Core & Libraries
         run: |
