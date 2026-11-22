@@ -61,17 +61,7 @@ jobs:
               1,
           )
 
-          # 2. Ambil signature asli triggerPopup(...) lalu pasang forward declaration sebelum setSeatRelayHold
-          m = re.search(r"([^\n;]*\btriggerPopup\s*\([^)]*\))\s*\{", src)
-          if m and "void setSeatRelayHold(" in src:
-              fwd_decl = m.group(1).strip() + ";"
-              src = src.replace(
-                  "void setSeatRelayHold(",
-                  fwd_decl + "\nvoid setSeatRelayHold(",
-                  1,
-              )
-
-          # 3. Samakan signature onTciEspNowSent dan bersihkan referensi (void)info;
+          # 2. Samakan signature onTciEspNowSent dan bersihkan referensi (void)info;
           src = src.replace(
               "void onTciEspNowSent(const wifi_tx_info_t *info, esp_now_send_status_t status)",
               "void onTciEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status)",
