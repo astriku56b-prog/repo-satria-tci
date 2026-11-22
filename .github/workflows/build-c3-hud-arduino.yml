@@ -2,25 +2,8 @@ name: Build Telemetry C3 & HUD S3 (Arduino CLI)
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-jobs:
-  build_arduino_modules:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Arduino CLI
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          echo "$HOME/bin" >> $GITHUB_PATH
-        name: Build Telemetry C3 & HUD S3 (Arduino CLI)
-
-on:
-  push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -54,32 +37,13 @@ jobs:
           mkdir -p out/hud_s3
           arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,CDCOnBoot=cdc --output-dir out/hud_s3 hud_s3_arduino
 
+      - name: List Compiled .bin Files
+        run: |
+          find out -type f -name "*.bin" -exec ls -lh {} +
+
       - name: Upload Compiled .bin Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: satria-c3-hud-bins
           path: out/**/*.bin
           if-no-files-found: error
-
-      - name: Configure ESP32 Core & Libraries
-        run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          arduino-cli core update-index
-          arduino-cli core install esp32:esp32
-          arduino-cli lib install "ArduinoJson" "ESPAsyncWebServer" "AsyncTCP" "LovyanGFX" "RTClib" "Adafruit Fingerprint Sensor Library"
-          arduino-cli lib install --git-url https://github.com/fbiego/ChronosESP32.git
-
-      - name: Compile Telemetry C3 (v10)
-        run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc --output-dir out/tele_c3 tele_c3_arduino
-
-      - name: Compile HUD S3 (v23)
-        run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,CDCOnBoot=cdc --output-dir out/hud_s3 hud_s3_arduino
-
-      - name: Upload Compiled .bin Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: satria-c3-hud-bins
-          path: out/**/*.bin
