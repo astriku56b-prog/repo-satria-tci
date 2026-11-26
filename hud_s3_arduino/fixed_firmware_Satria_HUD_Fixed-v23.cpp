@@ -10,47 +10,50 @@
 #include <Preferences.h>
 #include <LovyanGFX.hpp>
 #include <ChronosESP32.h>
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include <NimBLEDevice.h>
+#include <NimBLEScan.h>
+#include <NimBLEAdvertisedDevice.h>
 #include <atomic>
 #include <initializer_list>
 #include <cstring>
 #include <cctype>
+#include <string>
 #include "common_proto.h"
 
 // ============================================================================
 // KONFIGURASI PIN & HARDWARE (DISESUAIKAN UNTUK BOARD ESP32-S3 ST7789 170x320)
 // ============================================================================
+// Pin LCD Internal (tersolder di PCB, jangan dipakai untuk I/O lain)
 constexpr int PIN_LCD_RST  = 5;
 constexpr int PIN_LCD_CS   = 6;
 constexpr int PIN_LCD_DC   = 7;
 constexpr int PIN_LCD_SCLK = 8;
 constexpr int PIN_LCD_MOSI = 9;
-constexpr int PIN_LCD_BL   = 38;
+constexpr int PIN_LCD_BL   = 38; // Backlight LCD bawaan board (PWM aktif-HIGH)
 
-constexpr int PIN_BTN_MAIN   = 1;
-constexpr int PIN_BTN_EMRG   = 2;
-constexpr int PIN_BTN_ENROLL = 3;
+// Pin Header Eksternal yang Tersedia pada Board
+constexpr int PIN_BTN_MAIN   = 1;  // Tombol utama (navigasi/jok/mode/relock)
+constexpr int PIN_BTN_EMRG   = 2;  // Tombol emergency bypass (tahan 3.5s)
+constexpr int PIN_BTN_ENROLL = 3;  // Cadangan / tidak dipakai untuk enroll (dikontrol via Web Server)
 
-constexpr int PIN_RELAY      = 10;
-constexpr int PIN_RELAY_SEAT = 11;
-constexpr int PIN_LED_NOTIF  = 12;
-constexpr int PIN_BUZZER     = 13;
+constexpr int PIN_RELAY      = 10; // Relay utama pengapian / kontak
+constexpr int PIN_RELAY_SEAT = 11; // Relay pembuka jok elektrik
+constexpr int PIN_LED_NOTIF  = 12; // LED indikator notifikasi/status
+constexpr int PIN_BUZZER     = 13; // Buzzer aktif notifikasi
 
-constexpr int PIN_I2C_SDA  = 16;
-constexpr int PIN_I2C_SCL  = 21;
+constexpr int PIN_I2C_SDA  = 16; // I2C SDA untuk RTC DS3231
+constexpr int PIN_I2C_SCL  = 21; // I2C SCL untuk RTC DS3231
 
-constexpr int PIN_R503_RX  = 17;
-constexpr int PIN_R503_TX  = 18;
+constexpr int PIN_R503_RX  = 17; // UART2 RX (terhubung ke TX sensor R503)
+constexpr int PIN_R503_TX  = 18; // UART2 TX (terhubung ke RX sensor R503)
 
+// PWM Backlight LCD (Siang & Malam otomatis via RTC)
 constexpr uint8_t  LCD_BL_PWM_CH      = 0;
 constexpr uint32_t LCD_BL_PWM_FREQ    = 5000;
 constexpr uint8_t  LCD_BL_PWM_RES     = 8;
-constexpr uint8_t  LCD_BL_DUTY_DAY    = 240;
-constexpr uint8_t  LCD_BL_DUTY_NIGHT  = 115;
-constexpr uint16_t COL_FRAME          = 0x2104;
+constexpr uint8_t  LCD_BL_DUTY_DAY    = 240; // ~94% kecerahan siang (06:00 - 17:59)
+constexpr uint8_t  LCD_BL_DUTY_NIGHT  = 115; // ~45% kecerahan malam (18:00 - 05:59)
+constexpr uint16_t COL_FRAME          = 0x2104; // abu gelap untuk bingkai kartu UI
 
 // ============================================================================
 // KONFIGURASI PROTOKOL, SMARTWATCH IMMOBILIZER, WEB ENROLL & AMBANG BATAS
@@ -59,6 +62,7 @@ constexpr uint8_t TCI_WIFI_CHANNEL = 1;
 static const uint8_t HUD_S3_CUSTOM_MAC[6] = {0x02, 0x53, 0x46, 0x55, 0x48, 0x55};
 static const uint8_t DEFAULT_C3_MAC[6]     = {0x02, 0x53, 0x46, 0x55, 0x43, 0x33};
 
+// Smartwatch Immobilizer (one-shot saat daya nyala sampai relay ON)
 static constexpr char TARGET_WATCH_NAME[]   = "Galaxy Watch4 (3M7H)";
 static constexpr int  WATCH_UNLOCK_RSSI_MIN = -75;
 static constexpr unsigned long WATCH_SCAN_INTERVAL_MS = 1500;
@@ -66,15 +70,22 @@ static constexpr unsigned long WATCH_SCAN_WINDOW_MS   = 80;
 
 static constexpr char WEB_AP_SSID[] = "Satria-HUD-R503";
 static constexpr char WEB_AP_PASS[] = "satria1234";
-static constexpr unsigned long WEB_BOOT_WINDOW_MS = 30000;
+static constexpr unsigned long WEB_BOOT_WINDOW_MS = 30000; // Aktif 30 detik saat awal dinyalakan
 
+// Kunci MAC peer C3 setelah pairing pertama kali agar aman dari paket asing di parkiran
 constexpr bool STRICT_C3_PEER_LOCK = true;
+
+// Izinkan pembelajaran MAC C3 baru jika belum terkunci di NVS
 constexpr bool ALLOW_INITIAL_C3_LEARN = true;
+
+// Reset emergency bypass saat boot agar relay tidak menyala otomatis tanpa autentikasi ulang
 constexpr bool RESET_EMG_ON_BOOT = true;
 
+// Batas percobaan gagal sidik jari sebelum jeda cooldown
 constexpr uint8_t       FINGER_MAX_FAIL_STREAK = 10;
 constexpr unsigned long FINGER_FAIL_COOLDOWN_MS = 5000;
 
+// Interval polling navigasi & notifikasi Chronos (ms)
 constexpr unsigned long NAV_POLL_MS   = 150;
 constexpr unsigned long NOTIF_POLL_MS = 150;
 
@@ -89,9 +100,9 @@ constexpr uint16_t IDLE_MAX_RPM_MODE    = 400;
 constexpr uint16_t RPM_WARN_YELLOW      = 7500;
 constexpr uint16_t RPM_WARN_RED         = 10500;
 
-constexpr uint16_t BATT_MIN_WARN_10     = 115;
-constexpr uint16_t BATT_MAX_WARN_10     = 155;
-constexpr int16_t  ENG_TEMP_WARN_10     = 950;
+constexpr uint16_t BATT_MIN_WARN_10     = 115; // 11.5V
+constexpr uint16_t BATT_MAX_WARN_10     = 155; // 15.5V
+constexpr int16_t  ENG_TEMP_WARN_10     = 950; // 95.0C
 
 constexpr unsigned long DEBOUNCE_MS         = 50;
 constexpr unsigned long LONG_PRESS_MS       = 3000;
@@ -110,7 +121,7 @@ constexpr uint32_t WDT_TIMEOUT_SEC      = 5;
 constexpr uint32_t I2C_CLOCK_HZ         = 100000;
 constexpr uint8_t  MODE_SEND_MAX_RETRY  = 5;
 
-constexpr unsigned long STACK_CHECK_MS   = 60000;
+constexpr unsigned long STACK_CHECK_MS   = 60000; // interval cek sisa stack tiap task
 constexpr UBaseType_t   STACK_WARN_WORDS = 512;
 constexpr unsigned long DIAG_LOG_MS      = 30000;
 constexpr unsigned long RTC_READ_MS      = 500;
@@ -200,12 +211,13 @@ static std::atomic<bool> g_webServerActive{false};
 static std::atomic<bool> g_webServerExpired{false};
 static unsigned long g_webBootStartMs = 0;
 
+// State one-shot BLE smartwatch scan (aktif saat daya masuk sampai relay ON)
 static std::atomic<bool>          g_watchOneShotMatched{false};
 static std::atomic<bool>          g_watchScanFinished{false};
 static std::atomic<bool>          g_watchScanInProgress{false};
 static std::atomic<unsigned long> g_watchScanStartMs{0};
 static std::atomic<int>           g_watchMatchedRssi{-127};
-static BLEScan* g_pWatchScan = nullptr;
+static NimBLEScan* g_pWatchScan = nullptr;
 
 // ============================================================================
 // STRUKTUR PAKET TELEMETRI & PERINTAH
@@ -760,19 +772,20 @@ static void triggerPopup(const char* l1, const char* l2, uint16_t bgColor, uint1
 }
 
 // ============================================================================
-// ONE-SHOT SMARTWATCH BLE IMMOBILIZER (TARGET NAMA: "Galaxy Watch4 (3M7H)")
+// ONE-SHOT SMARTWATCH BLE IMMOBILIZER (NIMBLE 2.x, TARGET: "Galaxy Watch4 (3M7H)")
 // ============================================================================
-class WatchOneShotCallbacks : public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+class WatchOneShotCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    if (!advertisedDevice) return;
     if (g_watchOneShotMatched.load(std::memory_order_acquire) ||
         g_watchScanFinished.load(std::memory_order_acquire)) {
       return;
     }
-    if (!advertisedDevice.haveName()) return;
+    if (!advertisedDevice->haveName()) return;
 
-    const auto devName = advertisedDevice.getName();
+    const std::string devName = advertisedDevice->getName();
     if (strcmp(devName.c_str(), TARGET_WATCH_NAME) == 0) {
-      const int rssi = advertisedDevice.getRSSI();
+      const int rssi = advertisedDevice->getRSSI();
       if (rssi >= WATCH_UNLOCK_RSSI_MIN) {
         g_watchMatchedRssi.store(rssi, std::memory_order_release);
         g_watchOneShotMatched.store(true, std::memory_order_release);
@@ -803,18 +816,20 @@ static void pollWatchOneShotScan(unsigned long nowMs) {
 
   serviceStopWatchScanOnCore0();
 
+  // Berhenti permanen setelah relay ON sampai daya diputus / boot ulang
   if (g_watchScanFinished.load(std::memory_order_acquire) || isRelayAuthorizedAtomic()) {
     requestStopWatchScanOnce();
     serviceStopWatchScanOnCore0();
     return;
   }
 
+  // Tunda saat Web Server AP aktif agar radio 2.4 GHz tidak bentrok
   if (g_webServerActive.load(std::memory_order_acquire)) return;
 
   if (g_pWatchScan == nullptr) {
-    g_pWatchScan = BLEDevice::getScan();
+    g_pWatchScan = NimBLEDevice::getScan();
     if (g_pWatchScan) {
-      g_pWatchScan->setAdvertisedDeviceCallbacks(&g_watchScanCb, false);
+      g_pWatchScan->setScanCallbacks(&g_watchScanCb, false);
       g_pWatchScan->setActiveScan(true);
       g_pWatchScan->setInterval(80);
       g_pWatchScan->setWindow(40);
@@ -822,6 +837,7 @@ static void pollWatchOneShotScan(unsigned long nowMs) {
   }
   if (g_pWatchScan == nullptr) return;
 
+  // Akhiri window scan secara non-blocking pada Core 0
   if (g_watchScanInProgress.load(std::memory_order_acquire)) {
     if ((nowMs - g_watchScanStartMs.load(std::memory_order_acquire)) >= WATCH_SCAN_WINDOW_MS ||
         g_watchOneShotMatched.load(std::memory_order_acquire)) {
@@ -836,7 +852,7 @@ static void pollWatchOneShotScan(unsigned long nowMs) {
   lastScanStartMs = nowMs;
   g_watchScanStartMs.store(nowMs, std::memory_order_release);
   g_watchScanInProgress.store(true, std::memory_order_release);
-  g_pWatchScan->start(0, nullptr, false);
+  g_pWatchScan->start(0, false, true);
 }
 
 // ============================================================================
@@ -865,7 +881,7 @@ static void recoverI2cBus() {
 static void updateRtcCache() {
   if (!g_rtcOk.load(std::memory_order_acquire)) return;
 
-  DateTime now;
+  ::DateTime now;
   {
     ScopedLock lock(g_i2cMutex, 150);
     if (!lock) return;
@@ -1785,9 +1801,9 @@ static void syncRtcFromChronos() {
   wasChronosConnected = true;
 
   const int year   = watch.getYear();
-  const int month  = watch.getMonth() + 1;
+  const int month  = watch.getMonth() + 1; // ESP32Time/Chronos getMonth() = 0..11 -> 1..12
   const int day    = watch.getDay();
-  const int hour   = watch.getHour();
+  const int hour   = watch.getHour(true);    // Format 24 jam (0..23)
   const int minute = watch.getMinute();
   const int second = watch.getSecond();
 
@@ -1800,7 +1816,7 @@ static void syncRtcFromChronos() {
     return;
   }
 
-  const DateTime chronosDt(
+  const ::DateTime chronosDt(
     static_cast<uint16_t>(year),
     static_cast<uint8_t>(month),
     static_cast<uint8_t>(day),
@@ -1817,7 +1833,7 @@ static void syncRtcFromChronos() {
     if (!lock) return;
 
     if (!needAdjust) {
-      const DateTime rtcNow = rtc.now();
+      const ::DateTime rtcNow = rtc.now();
       if (rtcNow.year() >= 2020 && rtcNow.year() <= 2099) {
         const int32_t diffSec = static_cast<int32_t>(chronosDt.unixtime()) - static_cast<int32_t>(rtcNow.unixtime());
         if (diffSec > 2 || diffSec < -2) {
@@ -3699,7 +3715,7 @@ void setup() {
     }
   }
 
-  BLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::init(BLE_DEVICE_NAME);
   watch.begin();
   watch.set24Hour(true);
 
