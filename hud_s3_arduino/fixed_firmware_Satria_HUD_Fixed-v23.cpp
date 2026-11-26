@@ -3,63 +3,78 @@
 #include <RTClib.h>
 #include <Adafruit_Fingerprint.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_task_wdt.h>
 #include <Preferences.h>
 #include <LovyanGFX.hpp>
 #include <ChronosESP32.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
 #include <atomic>
+#include <initializer_list>
 #include <cstring>
 #include <cctype>
 #include "common_proto.h"
 
 // ============================================================================
-// KONFIGURASI PIN & HARDWARE
+// KONFIGURASI PIN & HARDWARE (DISESUAIKAN UNTUK BOARD ESP32-S3 ST7789 170x320)
 // ============================================================================
+constexpr int PIN_LCD_RST  = 5;
+constexpr int PIN_LCD_CS   = 6;
+constexpr int PIN_LCD_DC   = 7;
+constexpr int PIN_LCD_SCLK = 8;
+constexpr int PIN_LCD_MOSI = 9;
+constexpr int PIN_LCD_BL   = 38;
+
 constexpr int PIN_BTN_MAIN   = 1;
 constexpr int PIN_BTN_EMRG   = 2;
-constexpr int PIN_BTN_ENROLL = 38; // GPIO 38 aman (INPUT_PULLUP) untuk pendaftaran sidik jari R503
-constexpr int PIN_LED_NOTIF  = 39; // GPIO 39 aman (OUTPUT) untuk LED notifikasi/status
-constexpr int PIN_BUZZER     = 40; // GPIO 40 aman (OUTPUT/PWM) untuk buzzer notifikasi
-constexpr int PIN_RELAY      = 4;
-constexpr int PIN_RELAY_SEAT = 21; // GPIO 21 aman untuk relay pembuka jok elektrik
-constexpr int PIN_LCD_BL     = 42; // GPIO 42 aman untuk PWM backlight LCD
+constexpr int PIN_BTN_ENROLL = 3;
 
-constexpr int PIN_I2C_SDA  = 8;
-constexpr int PIN_I2C_SCL  = 9;
+constexpr int PIN_RELAY      = 10;
+constexpr int PIN_RELAY_SEAT = 11;
+constexpr int PIN_LED_NOTIF  = 12;
+constexpr int PIN_BUZZER     = 13;
+
+constexpr int PIN_I2C_SDA  = 16;
+constexpr int PIN_I2C_SCL  = 21;
 
 constexpr int PIN_R503_RX  = 17;
 constexpr int PIN_R503_TX  = 18;
 
-// PWM Backlight LCD (Siang & Malam otomatis via RTC)
 constexpr uint8_t  LCD_BL_PWM_CH      = 0;
 constexpr uint32_t LCD_BL_PWM_FREQ    = 5000;
 constexpr uint8_t  LCD_BL_PWM_RES     = 8;
-constexpr uint8_t  LCD_BL_DUTY_DAY    = 240; // ~94% kecerahan siang (06:00 - 17:59)
-constexpr uint8_t  LCD_BL_DUTY_NIGHT  = 115; // ~45% kecerahan malam (18:00 - 05:59)
+constexpr uint8_t  LCD_BL_DUTY_DAY    = 240;
+constexpr uint8_t  LCD_BL_DUTY_NIGHT  = 115;
+constexpr uint16_t COL_FRAME          = 0x2104;
 
 // ============================================================================
-// KONFIGURASI PROTOKOL, TIMING & AMBANG BATAS (DAILY-USE HARDENED v23)
+// KONFIGURASI PROTOKOL, SMARTWATCH IMMOBILIZER, WEB ENROLL & AMBANG BATAS
 // ============================================================================
 constexpr uint8_t TCI_WIFI_CHANNEL = 1;
 static const uint8_t HUD_S3_CUSTOM_MAC[6] = {0x02, 0x53, 0x46, 0x55, 0x48, 0x55};
 static const uint8_t DEFAULT_C3_MAC[6]     = {0x02, 0x53, 0x46, 0x55, 0x43, 0x33};
 
-// Kunci MAC peer C3 setelah pairing pertama kali agar aman dari paket asing di parkiran
+static constexpr char TARGET_WATCH_NAME[]   = "Galaxy Watch4 (3M7H)";
+static constexpr int  WATCH_UNLOCK_RSSI_MIN = -75;
+static constexpr unsigned long WATCH_SCAN_INTERVAL_MS = 1500;
+static constexpr unsigned long WATCH_SCAN_WINDOW_MS   = 80;
+
+static constexpr char WEB_AP_SSID[] = "Satria-HUD-R503";
+static constexpr char WEB_AP_PASS[] = "satria1234";
+static constexpr unsigned long WEB_BOOT_WINDOW_MS = 30000;
+
 constexpr bool STRICT_C3_PEER_LOCK = true;
-
-// Izinkan pembelajaran MAC C3 baru hanya jika belum terkunci
-constexpr bool ALLOW_INITIAL_C3_LEARN = false; // Nonaktif otomatis setelah lock agar aman dari spoof; aktifkan hanya saat pairing
-
-// Reset emergency bypass saat boot agar relay tidak menyala otomatis tanpa autentikasi ulang
+constexpr bool ALLOW_INITIAL_C3_LEARN = true;
 constexpr bool RESET_EMG_ON_BOOT = true;
 
-// Batas percobaan gagal sidik jari sebelum jeda cooldown
-constexpr uint8_t       FINGER_MAX_FAIL_STREAK = 5;
+constexpr uint8_t       FINGER_MAX_FAIL_STREAK = 10;
 constexpr unsigned long FINGER_FAIL_COOLDOWN_MS = 5000;
 
-// Interval polling navigasi & notifikasi Chronos (ms)
 constexpr unsigned long NAV_POLL_MS   = 150;
 constexpr unsigned long NOTIF_POLL_MS = 150;
 
@@ -74,20 +89,20 @@ constexpr uint16_t IDLE_MAX_RPM_MODE    = 400;
 constexpr uint16_t RPM_WARN_YELLOW      = 7500;
 constexpr uint16_t RPM_WARN_RED         = 10500;
 
-constexpr uint16_t BATT_MIN_WARN_10     = 115; // 11.5V
-constexpr uint16_t BATT_MAX_WARN_10     = 155; // 15.5V
-constexpr int16_t  ENG_TEMP_WARN_10     = 950; // 95.0C
+constexpr uint16_t BATT_MIN_WARN_10     = 115;
+constexpr uint16_t BATT_MAX_WARN_10     = 155;
+constexpr int16_t  ENG_TEMP_WARN_10     = 950;
 
 constexpr unsigned long DEBOUNCE_MS         = 50;
 constexpr unsigned long LONG_PRESS_MS       = 3000;
-constexpr unsigned long SEAT_MAX_HOLD_MS    = 8000; // Fail-safe maksimal relay jok menyala jika tombol stuck
-constexpr unsigned long EMERGENCY_HOLD_MS   = 3500; // Diperpanjang menjadi 3.5s agar tidak tersentuh tak sengaja saat jalan
+constexpr unsigned long SEAT_MAX_HOLD_MS    = 8000;
+constexpr unsigned long EMERGENCY_HOLD_MS   = 3500;
 constexpr unsigned long DOUBLE_TAP_MS       = 300;
 constexpr unsigned long TCI_TIMEOUT_MS      = 1500;
 constexpr unsigned long NAV_TIMEOUT_MS      = 10000;
 constexpr unsigned long NOTIF_POPUP_MS      = 5000;
-constexpr unsigned long ESPNOW_RETRY_MS     = 5000;
-constexpr unsigned long ENROLL_HOLD_MS      = 2000;
+constexpr unsigned long MODE_RETRY_INT_MS   = 450;
+constexpr unsigned long ENROLL_STEP_TMO_MS  = 6000;
 constexpr uint16_t      FINGER_MAX_SLOTS    = 127;
 
 constexpr int      ADV_HIST_LEN         = 160;
@@ -95,24 +110,32 @@ constexpr uint32_t WDT_TIMEOUT_SEC      = 5;
 constexpr uint32_t I2C_CLOCK_HZ         = 100000;
 constexpr uint8_t  MODE_SEND_MAX_RETRY  = 5;
 
-#define FAULT_NONE      0
-#define FAULT_TPS_OUT   (1 << 0)
-#define FAULT_NTC_OUT   (1 << 1)
-#define FAULT_BATT_LOW  (1 << 2)
-#define FAULT_BATT_HIGH (1 << 3)
-#define FAULT_NVS_ERR   (1 << 4)
-#define FAULT_ADC_ERR   (1 << 5)
+constexpr unsigned long STACK_CHECK_MS   = 60000;
+constexpr UBaseType_t   STACK_WARN_WORDS = 512;
+constexpr unsigned long DIAG_LOG_MS      = 30000;
+constexpr unsigned long RTC_READ_MS      = 500;
+constexpr unsigned long FINGER_POLL_MS   = 120;
+constexpr unsigned long TICKER_STEP_MS   = 95;
+constexpr unsigned long CURVE_REDRAW_MS  = 60;
 
-#define STATE_STOPPED   0
-#define STATE_CRANKING  1
-#define STATE_RUNNING   2
-#define STATE_LIMP_HOME 3
+constexpr uint16_t FAULT_NONE      = 0;
+constexpr uint16_t FAULT_TPS_OUT   = 1u << 0;
+constexpr uint16_t FAULT_NTC_OUT   = 1u << 1;
+constexpr uint16_t FAULT_BATT_LOW  = 1u << 2;
+constexpr uint16_t FAULT_BATT_HIGH = 1u << 3;
+constexpr uint16_t FAULT_NVS_ERR   = 1u << 4;
+constexpr uint16_t FAULT_ADC_ERR   = 1u << 5;
+
+constexpr uint8_t STATE_STOPPED   = 0;
+constexpr uint8_t STATE_CRANKING  = 1;
+constexpr uint8_t STATE_RUNNING   = 2;
+constexpr uint8_t STATE_LIMP_HOME = 3;
 
 // ============================================================================
-// DRIVER LAYAR LOVYANGFX (ILI9341 240x320 -> Rotasi 1 = 320x240)
+// DRIVER LAYAR LOVYANGFX (ST7789 170x320 -> Rotasi 1 = 320x170 Landscape)
 // ============================================================================
 class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ILI9341 _panel_instance;
+  lgfx::Panel_ST7789  _panel_instance;
   lgfx::Bus_SPI       _bus_instance;
 
 public:
@@ -126,26 +149,27 @@ public:
       cfg.spi_3wire   = false;
       cfg.use_lock    = true;
       cfg.dma_channel = SPI_DMA_CH_AUTO;
-      cfg.pin_sclk    = 12;
-      cfg.pin_mosi    = 11;
+      cfg.pin_sclk    = PIN_LCD_SCLK;
+      cfg.pin_mosi    = PIN_LCD_MOSI;
       cfg.pin_miso    = -1;
-      cfg.pin_dc      = 14;
+      cfg.pin_dc      = PIN_LCD_DC;
       _bus_instance.config(cfg);
       _panel_instance.setBus(&_bus_instance);
     }
     {
       auto cfg = _panel_instance.config();
-      cfg.pin_cs           = 10;
-      cfg.pin_rst          = 13;
+      cfg.pin_cs           = PIN_LCD_CS;
+      cfg.pin_rst          = PIN_LCD_RST;
       cfg.pin_busy         = -1;
-      cfg.panel_width      = 240;
+      cfg.panel_width      = 170;
       cfg.panel_height     = 320;
-      cfg.offset_x         = 0;
+      cfg.offset_x         = 35;
       cfg.offset_y         = 0;
+      cfg.offset_rotation  = 0;
       cfg.dummy_read_pixel = 8;
       cfg.dummy_read_bits  = 1;
       cfg.readable         = false;
-      cfg.invert           = false;
+      cfg.invert           = true;
       cfg.rgb_order        = false;
       cfg.dlen_16bit       = false;
       cfg.bus_shared       = false;
@@ -167,13 +191,27 @@ static Adafruit_Fingerprint finger(&r503Serial);
 static std::atomic<bool>          g_r503Ok{false};
 static std::atomic<uint8_t>       g_lastR503Err{0};
 static std::atomic<uint8_t>       g_fingerFailStreak{0};
-static std::atomic<unsigned long> g_fingerCooldownUntilMs{0};
+static std::atomic<bool>          g_fingerCooldownActive{false};
+static std::atomic<unsigned long> g_fingerCooldownStartMs{0};
 
 static ChronosESP32 watch(BLE_DEVICE_NAME);
+static WebServer g_webServer(80);
+static std::atomic<bool> g_webServerActive{false};
+static std::atomic<bool> g_webServerExpired{false};
+static unsigned long g_webBootStartMs = 0;
+
+static std::atomic<bool>          g_watchOneShotMatched{false};
+static std::atomic<bool>          g_watchScanFinished{false};
+static std::atomic<bool>          g_watchScanInProgress{false};
+static std::atomic<unsigned long> g_watchScanStartMs{0};
+static std::atomic<int>           g_watchMatchedRssi{-127};
+static BLEScan* g_pWatchScan = nullptr;
 
 // ============================================================================
 // STRUKTUR PAKET TELEMETRI & PERINTAH
 // ============================================================================
+#ifndef COMMON_PROTO_STRUCTS_DEFINED
+#define COMMON_PROTO_STRUCTS_DEFINED
 struct __attribute__((packed)) TelemetryData {
   uint16_t header;
   uint16_t rpm;
@@ -194,6 +232,7 @@ struct __attribute__((packed)) CommandData {
   uint8_t  requestedMode;
   uint16_t crc16;
 };
+#endif
 
 static_assert(sizeof(TelemetryData) == 19, "Ukuran TelemetryData harus 19 byte");
 static_assert(sizeof(CommandData) == 5, "Ukuran CommandData tidak sesuai");
@@ -258,17 +297,8 @@ struct NavTelemetryData {
 
 static portMUX_TYPE g_navMux = portMUX_INITIALIZER_UNLOCKED;
 static NavTelemetryData g_navData = {
-  false,
-  false,
-  NAV_TURN_NONE,
-  "STANDBY",
-  "--",
-  "-- KM/J",
-  "Buka GMaps & Chronos",
-  "--",
-  "--",
-  0,
-  0
+  false, false, NAV_TURN_NONE, "STANDBY", "--", "-- KM/J",
+  "Buka GMaps & Chronos", "--", "--", 0, 0
 };
 
 struct NotifPopupData {
@@ -285,7 +315,7 @@ static portMUX_TYPE g_notifMux = portMUX_INITIALIZER_UNLOCKED;
 static NotifPopupData g_notifPopup = {false, "", "", "", 0, NOTIF_POPUP_MS, 0};
 
 // ============================================================================
-// STATE SISTEM & SINKRONISASI RTOS
+// STATE SISTEM, ENROLL WEB & SINKRONISASI RTOS
 // ============================================================================
 enum BootState : uint8_t {
   BOOT_WAIT_FINGERPRINT = 0,
@@ -302,9 +332,9 @@ enum Core0CmdType : uint8_t {
   CMD_PAGE_CHANGED = 1,
   CMD_SUBPAGE_TOGGLE,
   CMD_TCI_NEXT_MODE,
-  CMD_OPEN_SEAT,
   CMD_SYSTEM_LOCKED,
-  CMD_SAVE_EMG_STATE
+  CMD_SAVE_EMG_STATE,
+  CMD_RESET_C3_MAC
 };
 
 struct Core0Command {
@@ -313,6 +343,34 @@ struct Core0Command {
   PageId       nextPage;
   bool         flagVal;
 };
+
+enum EnrollCmdType : uint8_t {
+  ENROLL_CMD_ADD = 1,
+  ENROLL_CMD_SAVE,
+  ENROLL_CMD_DELETE,
+  ENROLL_CMD_ABORT
+};
+
+struct EnrollCommand {
+  EnrollCmdType type;
+  uint16_t      slotId;
+};
+
+enum WebEnrollStage : uint8_t {
+  WEB_ENROLL_IDLE = 0,
+  WEB_ENROLL_FIND_SLOT,
+  WEB_ENROLL_WAIT_FINGER_1,
+  WEB_ENROLL_WAIT_LIFT,
+  WEB_ENROLL_WAIT_FINGER_2,
+  WEB_ENROLL_READY_TO_SAVE,
+  WEB_ENROLL_SAVED,
+  WEB_ENROLL_ERROR
+};
+
+static portMUX_TYPE g_webEnrollMux = portMUX_INITIALIZER_UNLOCKED;
+static WebEnrollStage g_webEnrollStage = WEB_ENROLL_IDLE;
+static uint16_t g_webTargetSlot = 0;
+static char g_webEnrollMsg[56] = "Web aktif 30 detik saat boot";
 
 static BootState     g_bootState       = BOOT_WAIT_FINGERPRINT;
 static PageId        g_currentPage     = PAGE_HOME;
@@ -325,6 +383,7 @@ static unsigned long g_seatOpenStartMs = 0;
 static std::atomic<bool> g_tciEspNowReady{false};
 static std::atomic<bool> g_tciRxEnabled{false};
 static std::atomic<bool> g_allowChronosNotif{true};
+static std::atomic<bool> g_watchStopPending{false};
 
 static std::atomic<uint32_t> g_diagCrcErr{0};
 static std::atomic<uint32_t> g_diagMacDrop{0};
@@ -335,7 +394,7 @@ static SemaphoreHandle_t g_nvsMutex  = nullptr;
 static SemaphoreHandle_t g_r503Mutex = nullptr;
 
 static portMUX_TYPE g_stateMux = portMUX_INITIALIZER_UNLOCKED;
-static char g_fingerStatus[32] = "R503 Ready";
+static char g_fingerStatus[32] = "R503 + GW4 Ready";
 static char g_timeStr[12]      = "00:00:00";
 static char g_dateStr[16]      = "01-01-2026";
 static float g_chipTempC       = 0.0f;
@@ -360,6 +419,7 @@ static bool             g_pendingModeChange = false;
 static uint8_t          g_desiredMode       = 0;
 static uint8_t          g_modeRetryCount    = 0;
 static unsigned long    g_lastModeSendMs    = 0;
+static uint32_t         g_modeReqStartSeq   = 0;
 static volatile bool    g_lastEspSendOk     = false;
 static volatile bool    g_espSendCbSeen     = false;
 
@@ -370,6 +430,74 @@ static uint8_t          g_pendingPeerMac[6] = {0};
 
 static QueueHandle_t g_core0CmdQueue   = nullptr;
 static QueueHandle_t g_espNowRxQueue   = nullptr;
+static QueueHandle_t g_enrollCmdQueue  = nullptr;
+
+// ============================================================================
+// UTILITAS DASAR
+// ============================================================================
+static inline void copyStr(char *dst, size_t dstSize, const char *src) {
+  if (!dst || dstSize == 0) return;
+  strncpy(dst, src ? src : "", dstSize - 1);
+  dst[dstSize - 1] = '\0';
+}
+template <size_t N>
+static inline void copyStr(char (&dst)[N], const char *src) { copyStr(dst, N, src); }
+
+class CritSection {
+public:
+  explicit CritSection(portMUX_TYPE &m) : _m(m) { portENTER_CRITICAL(&_m); }
+  ~CritSection() { portEXIT_CRITICAL(&_m); }
+  CritSection(const CritSection &) = delete;
+  CritSection &operator=(const CritSection &) = delete;
+private:
+  portMUX_TYPE &_m;
+};
+
+class ScopedLock {
+public:
+  ScopedLock(SemaphoreHandle_t m, uint32_t timeoutMs, bool passIfNull = false)
+    : _m(m),
+      _held(m && xSemaphoreTake(m, pdMS_TO_TICKS(timeoutMs)) == pdTRUE),
+      _ok(_held || (!m && passIfNull)) {}
+  ~ScopedLock() { release(); }
+  void release() { if (_held) { xSemaphoreGive(_m); _held = false; } }
+  explicit operator bool() const { return _ok; }
+  ScopedLock(const ScopedLock &) = delete;
+  ScopedLock &operator=(const ScopedLock &) = delete;
+private:
+  SemaphoreHandle_t _m;
+  bool _held;
+  bool _ok;
+};
+
+struct GfxBatch {
+  GfxBatch()  { lcd.startWrite(); }
+  ~GfxBatch() { lcd.endWrite(); }
+  GfxBatch(const GfxBatch &) = delete;
+  GfxBatch &operator=(const GfxBatch &) = delete;
+};
+
+static inline bool isTciOnline(unsigned long lastRxMs, unsigned long nowMs) {
+  return (lastRxMs > 0) && ((nowMs - lastRxMs) < TCI_TIMEOUT_MS);
+}
+
+static void postCore0(Core0CmdType type, PageId prev = PAGE_HOME, PageId next = PAGE_HOME, bool flag = false) {
+  if (!g_core0CmdQueue) return;
+  Core0Command cmd = {type, prev, next, flag};
+  xQueueSend(g_core0CmdQueue, &cmd, 0);
+}
+
+static void setFingerStatus(const char *text, bool needFullClear = false) {
+  CritSection cs(g_stateMux);
+  copyStr(g_fingerStatus, text);
+  if (needFullClear) g_needFullClear = true;
+}
+
+static void triggerPopup(const char* l1, const char* l2, uint16_t bgColor, uint16_t durationMs = 1500);
+static void syncTelemetryGate(PageId page);
+static void initTciEspNowOnce();
+static void requestStopWatchScanOnce();
+static void serviceStopWatchScanOnCore0();
 
 // ============================================================================
 // HELPER UTILITAS, PWM BACKLIGHT & NVS PERSISTENCE
@@ -411,61 +539,56 @@ static void updateAdaptiveBacklight() {
   }
 }
 
-static void saveEmergencyStateToNvs(bool emgState);
-
-static void loadPersistentSettings() {
-  if (g_nvsMutex && xSemaphoreTake(g_nvsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    bool savedEmg = false;
-    bool hasMac = false;
-    uint8_t savedMac[6] = {0};
-
-    if (prefs.begin(NVS_NAMESPACE, true)) {
-      savedEmg = prefs.getBool("emg_bypass", false);
-      size_t macLen = prefs.getBytesLength("c3_mac");
-      hasMac = (macLen == 6 && prefs.getBytes("c3_mac", savedMac, 6) == 6);
-      prefs.end();
-    }
-
-    bool activeEmgOnBoot = RESET_EMG_ON_BOOT ? false : savedEmg;
-
-    portENTER_CRITICAL(&g_stateMux);
-    g_emergencyByPass = activeEmgOnBoot;
-    if (activeEmgOnBoot) {
-      memcpy(g_fingerStatus, "EMERGENCY ON", sizeof(g_fingerStatus));
-    } else if (savedEmg) {
-      memcpy(g_fingerStatus, "LOCKED (EMG RST)", sizeof(g_fingerStatus));
-    }
-    if (hasMac) {
-      memcpy(activeC3PeerMac, savedMac, 6);
-      g_c3MacLocked = true;
-    }
-    portEXIT_CRITICAL(&g_stateMux);
-
-    xSemaphoreGive(g_nvsMutex);
-
-    if (RESET_EMG_ON_BOOT && savedEmg) {
-      saveEmergencyStateToNvs(false);
-    }
+template <typename Fn>
+static void nvsWrite(Fn &&fn) {
+  ScopedLock lock(g_nvsMutex, 100);
+  if (!lock) return;
+  if (prefs.begin(NVS_NAMESPACE, false)) {
+    fn(prefs);
+    prefs.end();
   }
 }
 
 static void saveEmergencyStateToNvs(bool emgState) {
-  if (g_nvsMutex && xSemaphoreTake(g_nvsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (prefs.begin(NVS_NAMESPACE, false)) {
-      prefs.putBool("emg_bypass", emgState);
-      prefs.end();
-    }
-    xSemaphoreGive(g_nvsMutex);
-  }
+  nvsWrite([&](Preferences &p) { p.putBool("emg_bypass", emgState); });
 }
 
 static void saveC3MacToNvs(const uint8_t mac[6]) {
-  if (g_nvsMutex && xSemaphoreTake(g_nvsMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-    if (prefs.begin(NVS_NAMESPACE, false)) {
-      prefs.putBytes("c3_mac", mac, 6);
+  nvsWrite([&](Preferences &p) { p.putBytes("c3_mac", mac, 6); });
+}
+
+static void clearC3MacFromNvs() {
+  nvsWrite([](Preferences &p) { p.remove("c3_mac"); });
+}
+
+static void loadPersistentSettings() {
+  bool savedEmg = false;
+  {
+    ScopedLock lock(g_nvsMutex, 100);
+    if (!lock) return;
+
+    bool hasMac = false;
+    uint8_t savedMac[6] = {0};
+    if (prefs.begin(NVS_NAMESPACE, true)) {
+      savedEmg = prefs.getBool("emg_bypass", false);
+      hasMac = (prefs.getBytesLength("c3_mac") == 6 && prefs.getBytes("c3_mac", savedMac, 6) == 6);
       prefs.end();
     }
-    xSemaphoreGive(g_nvsMutex);
+
+    const bool activeEmgOnBoot = RESET_EMG_ON_BOOT ? false : savedEmg;
+
+    CritSection cs(g_stateMux);
+    g_emergencyByPass = activeEmgOnBoot;
+    if (activeEmgOnBoot)  copyStr(g_fingerStatus, "EMERGENCY ON");
+    else if (savedEmg)    copyStr(g_fingerStatus, "LOCKED (EMG RST)");
+    if (hasMac) {
+      memcpy(activeC3PeerMac, savedMac, 6);
+      g_c3MacLocked = true;
+    }
+  }
+
+  if (RESET_EMG_ON_BOOT && savedEmg) {
+    saveEmergencyStateToNvs(false);
   }
 }
 
@@ -486,6 +609,27 @@ static void sanitizeAsciiInPlace(char *s, bool replaceNewlineWithSpace = true) {
   s[w] = '\0';
 }
 
+static void formatJsonEscaped(const char *src, char *dst, size_t dstSize) {
+  if (!dst || dstSize == 0) return;
+  if (!src) {
+    dst[0] = '\0';
+    return;
+  }
+  size_t w = 0;
+  for (size_t r = 0; src[r] != '\0' && w + 2 < dstSize; r++) {
+    unsigned char ch = static_cast<unsigned char>(src[r]);
+    if (ch == '"' || ch == '\\') {
+      dst[w++] = '\\';
+      dst[w++] = static_cast<char>(ch);
+    } else if (ch == '\n') {
+      dst[w++] = ' ';
+    } else if (ch >= 0x20 && ch <= 0x7E) {
+      dst[w++] = static_cast<char>(ch);
+    }
+  }
+  dst[w] = '\0';
+}
+
 static void trimAsciiInPlace(char *s) {
   if (!s) return;
   size_t len = strlen(s);
@@ -499,6 +643,13 @@ static void trimAsciiInPlace(char *s) {
   if (start > 0) {
     memmove(s, s + start, len - start + 1);
   }
+}
+
+template <size_t N>
+static void copyCleanAscii(char (&dst)[N], const char *src, bool newlineToSpace = true) {
+  copyStr(dst, N, src);
+  sanitizeAsciiInPlace(dst, newlineToSpace);
+  trimAsciiInPlace(dst);
 }
 
 static bool containsIgnoreCase(const char *haystack, const char *needle) {
@@ -517,143 +668,209 @@ static bool containsIgnoreCase(const char *haystack, const char *needle) {
 }
 
 static uint8_t getTciSubPageAtomic() {
-  portENTER_CRITICAL(&g_stateMux);
-  uint8_t sp = g_tciSubPage;
-  portEXIT_CRITICAL(&g_stateMux);
-  return sp;
+  CritSection cs(g_stateMux);
+  return g_tciSubPage;
 }
 
 static void setTciSubPageAtomic(uint8_t sp, bool fullClear) {
-  portENTER_CRITICAL(&g_stateMux);
+  CritSection cs(g_stateMux);
   g_tciSubPage = sp;
   if (fullClear) g_needFullClear = true;
-  portEXIT_CRITICAL(&g_stateMux);
 }
 
-inline void applyRelayOutput(unsigned long nowMs = 0) {
+static inline void applyRelayOutput(unsigned long nowMs = 0) {
   if (nowMs == 0) nowMs = millis();
-  bool relayOn = false;
-  bool seatOn  = false;
-  portENTER_CRITICAL(&g_stateMux);
-  relayOn = (g_systemUnlocked || g_emergencyByPass);
-  if (g_seatRelayActive && ((nowMs - g_seatOpenStartMs) >= SEAT_MAX_HOLD_MS)) {
-    g_seatRelayActive = false;
+  bool relayOn;
+  bool seatOn;
+  {
+    CritSection cs(g_stateMux);
+    relayOn = (g_systemUnlocked || g_emergencyByPass);
+    if (g_seatRelayActive && ((nowMs - g_seatOpenStartMs) >= SEAT_MAX_HOLD_MS)) {
+      g_seatRelayActive = false;
+    }
+    seatOn = g_seatRelayActive;
   }
-  seatOn = g_seatRelayActive;
-  portEXIT_CRITICAL(&g_stateMux);
   digitalWrite(PIN_RELAY, relayOn ? HIGH : LOW);
   digitalWrite(PIN_RELAY_SEAT, seatOn ? HIGH : LOW);
+  if (relayOn) {
+    requestStopWatchScanOnce();
+  }
 }
 
-void setSeatRelayHold(bool active, unsigned long nowMs = 0) {
+static void setSeatRelayHold(bool active, unsigned long nowMs = 0) {
   if (nowMs == 0) nowMs = millis();
   bool changed = false;
-  portENTER_CRITICAL(&g_stateMux);
-  if (g_seatRelayActive != active) {
-    g_seatRelayActive = active;
-    changed = true;
-    if (active) {
-      g_seatOpenStartMs = nowMs;
+  {
+    CritSection cs(g_stateMux);
+    if (g_seatRelayActive != active) {
+      g_seatRelayActive = active;
+      changed = true;
+      if (active) g_seatOpenStartMs = nowMs;
     }
   }
-  portEXIT_CRITICAL(&g_stateMux);
   applyRelayOutput(nowMs);
   if (active && changed) {
     triggerPopup("JOK TERBUKA", "LEPAS TOMBOL OFF", TFT_CYAN, 2000);
   }
 }
 
-void setSystemStateAtomic(BootState bState, PageId page, bool unlocked, bool fullClear) {
-  portENTER_CRITICAL(&g_stateMux);
+static void setSystemStateAtomic(BootState bState, PageId page, bool unlocked, bool fullClear) {
+  CritSection cs(g_stateMux);
   g_bootState      = bState;
   g_currentPage    = page;
   g_systemUnlocked = unlocked;
-  if (fullClear) {
-    g_needFullClear = true;
-  }
-  portEXIT_CRITICAL(&g_stateMux);
+  if (fullClear) g_needFullClear = true;
 }
 
-void readSystemStateAtomic(BootState &bState, PageId &page, bool &unlocked, bool &emgBypass, bool &fullClear, bool consumeClear = true) {
-  portENTER_CRITICAL(&g_stateMux);
-  bState    = g_bootState;
-  page      = g_currentPage;
-  unlocked  = g_systemUnlocked;
-  emgBypass = g_emergencyByPass;
-  fullClear = g_needFullClear;
-  if (consumeClear) {
-    g_needFullClear = false;
-  }
-  portEXIT_CRITICAL(&g_stateMux);
+static PageId getCurrentPageAtomic() {
+  CritSection cs(g_stateMux);
+  return g_currentPage;
+}
+
+static bool isSystemUnlockedAtomic() {
+  CritSection cs(g_stateMux);
+  return g_systemUnlocked;
+}
+
+static bool isSeatRelayActiveAtomic() {
+  CritSection cs(g_stateMux);
+  return g_seatRelayActive;
 }
 
 static bool isRelayAuthorizedAtomic() {
-  portENTER_CRITICAL(&g_stateMux);
-  bool ok = (g_systemUnlocked || g_emergencyByPass);
-  portEXIT_CRITICAL(&g_stateMux);
-  return ok;
+  CritSection cs(g_stateMux);
+  return (g_systemUnlocked || g_emergencyByPass);
 }
 
-bool isUnlockedAndOnTciPage() {
+static bool isUnlockedAndOnTciPage() {
   if (!g_tciRxEnabled.load(std::memory_order_acquire)) return false;
-  portENTER_CRITICAL(&g_stateMux);
-  bool ok = ((g_systemUnlocked || g_emergencyByPass) && g_currentPage == PAGE_TCI);
-  portEXIT_CRITICAL(&g_stateMux);
-  return ok;
+  CritSection cs(g_stateMux);
+  return ((g_systemUnlocked || g_emergencyByPass) && g_currentPage == PAGE_TCI);
 }
 
-void triggerPopup(const char* l1, const char* l2, uint16_t bgColor, uint16_t durationMs = 1500) {
-  char buf1[20];
-  char buf2[20];
-  strncpy(buf1, l1 ? l1 : "", sizeof(buf1) - 1);
-  buf1[sizeof(buf1) - 1] = '\0';
-  strncpy(buf2, l2 ? l2 : "", sizeof(buf2) - 1);
-  buf2[sizeof(buf2) - 1] = '\0';
-  unsigned long startMs = millis();
-
-  portENTER_CRITICAL(&g_stateMux);
-  memcpy(g_popupLine1, buf1, sizeof(g_popupLine1));
-  memcpy(g_popupLine2, buf2, sizeof(g_popupLine2));
+static void triggerPopup(const char* l1, const char* l2, uint16_t bgColor, uint16_t durationMs) {
+  const unsigned long startMs = millis();
+  CritSection cs(g_stateMux);
+  copyStr(g_popupLine1, l1);
+  copyStr(g_popupLine2, l2);
   g_popupBgColor    = bgColor;
   g_popupStartMs    = startMs;
   g_popupDurationMs = durationMs;
   g_popupSeq++;
-  portEXIT_CRITICAL(&g_stateMux);
+}
+
+// ============================================================================
+// ONE-SHOT SMARTWATCH BLE IMMOBILIZER (TARGET NAMA: "Galaxy Watch4 (3M7H)")
+// ============================================================================
+class WatchOneShotCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    if (g_watchOneShotMatched.load(std::memory_order_acquire) ||
+        g_watchScanFinished.load(std::memory_order_acquire)) {
+      return;
+    }
+    if (!advertisedDevice.haveName()) return;
+
+    const auto devName = advertisedDevice.getName();
+    if (strcmp(devName.c_str(), TARGET_WATCH_NAME) == 0) {
+      const int rssi = advertisedDevice.getRSSI();
+      if (rssi >= WATCH_UNLOCK_RSSI_MIN) {
+        g_watchMatchedRssi.store(rssi, std::memory_order_release);
+        g_watchOneShotMatched.store(true, std::memory_order_release);
+      }
+    }
+  }
+};
+
+static WatchOneShotCallbacks g_watchScanCb;
+
+static void requestStopWatchScanOnce() {
+  if (!g_watchScanFinished.exchange(true, std::memory_order_acq_rel)) {
+    g_watchStopPending.store(true, std::memory_order_release);
+  }
+}
+
+static void serviceStopWatchScanOnCore0() {
+  if (!g_watchStopPending.exchange(false, std::memory_order_acq_rel)) return;
+  g_watchScanInProgress.store(false, std::memory_order_release);
+  if (g_pWatchScan != nullptr) {
+    g_pWatchScan->stop();
+    g_pWatchScan->clearResults();
+  }
+}
+
+static void pollWatchOneShotScan(unsigned long nowMs) {
+  static unsigned long lastScanStartMs = 0;
+
+  serviceStopWatchScanOnCore0();
+
+  if (g_watchScanFinished.load(std::memory_order_acquire) || isRelayAuthorizedAtomic()) {
+    requestStopWatchScanOnce();
+    serviceStopWatchScanOnCore0();
+    return;
+  }
+
+  if (g_webServerActive.load(std::memory_order_acquire)) return;
+
+  if (g_pWatchScan == nullptr) {
+    g_pWatchScan = BLEDevice::getScan();
+    if (g_pWatchScan) {
+      g_pWatchScan->setAdvertisedDeviceCallbacks(&g_watchScanCb, false);
+      g_pWatchScan->setActiveScan(true);
+      g_pWatchScan->setInterval(80);
+      g_pWatchScan->setWindow(40);
+    }
+  }
+  if (g_pWatchScan == nullptr) return;
+
+  if (g_watchScanInProgress.load(std::memory_order_acquire)) {
+    if ((nowMs - g_watchScanStartMs.load(std::memory_order_acquire)) >= WATCH_SCAN_WINDOW_MS ||
+        g_watchOneShotMatched.load(std::memory_order_acquire)) {
+      g_pWatchScan->stop();
+      g_pWatchScan->clearResults();
+      g_watchScanInProgress.store(false, std::memory_order_release);
+    }
+    return;
+  }
+
+  if ((nowMs - lastScanStartMs) < WATCH_SCAN_INTERVAL_MS) return;
+  lastScanStartMs = nowMs;
+  g_watchScanStartMs.store(nowMs, std::memory_order_release);
+  g_watchScanInProgress.store(true, std::memory_order_release);
+  g_pWatchScan->start(0, nullptr, false);
 }
 
 // ============================================================================
 // I2C & RTC DS3231
 // ============================================================================
-void recoverI2cBus() {
-  if (g_i2cMutex && xSemaphoreTake(g_i2cMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-    Serial.println("[I2C] Recovering bus...");
-    Wire.end();
-    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
-    pinMode(PIN_I2C_SCL, OUTPUT);
-    for (int i = 0; i < 9; i++) {
-      digitalWrite(PIN_I2C_SCL, HIGH);
-      delayMicroseconds(5);
-      digitalWrite(PIN_I2C_SCL, LOW);
-      delayMicroseconds(5);
-    }
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_CLOCK_HZ);
-    Wire.setTimeOut(50);
-    xSemaphoreGive(g_i2cMutex);
-  }
+static void beginI2c() {
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_CLOCK_HZ);
+  Wire.setTimeOut(50);
 }
 
-void updateRtcCache() {
+static void recoverI2cBus() {
+  ScopedLock lock(g_i2cMutex, 200);
+  if (!lock) return;
+  Wire.end();
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  pinMode(PIN_I2C_SCL, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(PIN_I2C_SCL, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_I2C_SCL, LOW);
+    delayMicroseconds(5);
+  }
+  beginI2c();
+}
+
+static void updateRtcCache() {
   if (!g_rtcOk.load(std::memory_order_acquire)) return;
 
   DateTime now;
-  bool readOk = false;
-  if (g_i2cMutex && xSemaphoreTake(g_i2cMutex, pdMS_TO_TICKS(150)) == pdTRUE) {
+  {
+    ScopedLock lock(g_i2cMutex, 150);
+    if (!lock) return;
     now = rtc.now();
-    readOk = true;
-    xSemaphoreGive(g_i2cMutex);
   }
-
-  if (!readOk) return;
 
   if (now.year() < 2020 || now.year() > 2099 || now.hour() > 23 || now.minute() > 59 || now.second() > 59) {
     recoverI2cBus();
@@ -672,12 +889,11 @@ void updateRtcCache() {
     chipC = 0.0f;
   }
 
-  portENTER_CRITICAL(&g_stateMux);
+  CritSection cs(g_stateMux);
   memcpy(g_timeStr, tBuf, sizeof(g_timeStr));
   memcpy(g_dateStr, dBuf, sizeof(g_dateStr));
   g_chipTempC = chipC;
   g_rtcSeq++;
-  portEXIT_CRITICAL(&g_stateMux);
 }
 
 // ============================================================================
@@ -693,8 +909,9 @@ enum BuzzerPattern : uint8_t {
 };
 
 struct NotifHardwareState {
-  uint8_t       ledMode; // 0=off, 1=steady, 2=blink fast, 3=pulse slow
-  unsigned long ledUntilMs;
+  uint8_t       ledMode;
+  unsigned long ledStartMs;
+  unsigned long ledDurationMs;
   unsigned long ledLastToggleMs;
   bool          ledPinState;
 
@@ -705,111 +922,134 @@ struct NotifHardwareState {
 };
 
 static portMUX_TYPE g_hwNotifMux = portMUX_INITIALIZER_UNLOCKED;
-static NotifHardwareState g_hwNotif = {0, 0, 0, false, BUZZ_NONE, 0, 0, false};
+static NotifHardwareState g_hwNotif = {0, 0, 0, 0, false, BUZZ_NONE, 0, 0, false};
 
-static void setBuzzerTonePin(bool on) {
-  digitalWrite(PIN_BUZZER, on ? HIGH : LOW);
-}
-
-static void setLedNotifPin(bool on) {
-  digitalWrite(PIN_LED_NOTIF, on ? HIGH : LOW);
-}
-
-void triggerLedAndBuzzer(uint8_t ledMode, uint16_t ledDurationMs, BuzzerPattern pat, unsigned long nowMs = 0) {
+static void triggerLedAndBuzzer(uint8_t ledMode, uint16_t ledDurationMs, BuzzerPattern pat, unsigned long nowMs = 0) {
   if (nowMs == 0) nowMs = millis();
   portENTER_CRITICAL(&g_hwNotifMux);
   if (ledMode > 0) {
-    g_hwNotif.ledMode = ledMode;
-    g_hwNotif.ledUntilMs = nowMs + ledDurationMs;
+    g_hwNotif.ledMode         = ledMode;
+    g_hwNotif.ledStartMs      = nowMs;
+    g_hwNotif.ledDurationMs   = ledDurationMs;
     g_hwNotif.ledLastToggleMs = nowMs;
-    g_hwNotif.ledPinState = true;
+    g_hwNotif.ledPinState     = true;
   }
   if (pat != BUZZ_NONE) {
-    g_hwNotif.buzzPat = pat;
-    g_hwNotif.buzzStep = 0;
+    g_hwNotif.buzzPat         = pat;
+    g_hwNotif.buzzStep        = 0;
     g_hwNotif.buzzStepStartMs = nowMs;
-    g_hwNotif.buzzActiveTone = true;
+    g_hwNotif.buzzActiveTone  = true;
   }
   portEXIT_CRITICAL(&g_hwNotifMux);
 }
 
-void serviceLedAndBuzzer(bool systemUnlockedOrEmg, unsigned long nowMs = 0) {
+struct BuzzStep { bool on; uint16_t ms; };
+struct BuzzSeq  { const BuzzStep *steps; uint8_t len; };
+
+static constexpr BuzzStep BUZZ_SEQ_UNLOCK[]      = {{true, 90}, {false, 60}, {true, 140}};
+static constexpr BuzzStep BUZZ_SEQ_ALERT[]       = {{true, 120}, {false, 90}, {true, 220}};
+static constexpr BuzzStep BUZZ_SEQ_ENROLL_STEP[] = {{true, 80}};
+static constexpr BuzzStep BUZZ_SEQ_ENROLL_OK[]   = {{true, 80}, {false, 70}, {true, 80}, {false, 70}, {true, 180}};
+static constexpr BuzzStep BUZZ_SEQ_NOTIF[]       = {{true, 60}};
+
+template <size_t N>
+static constexpr BuzzSeq makeSeq(const BuzzStep (&a)[N]) { return {a, static_cast<uint8_t>(N)}; }
+
+static constexpr BuzzSeq BUZZ_SEQS[] = {
+  {nullptr, 0},
+  makeSeq(BUZZ_SEQ_UNLOCK),
+  makeSeq(BUZZ_SEQ_ALERT),
+  makeSeq(BUZZ_SEQ_ENROLL_STEP),
+  makeSeq(BUZZ_SEQ_ENROLL_OK),
+  makeSeq(BUZZ_SEQ_NOTIF)
+};
+static_assert(sizeof(BUZZ_SEQS) / sizeof(BUZZ_SEQS[0]) == BUZZ_NOTIF + 1, "BUZZ_SEQS harus sinkron dengan BuzzerPattern");
+
+static void serviceLedAndBuzzer(bool systemUnlockedOrEmg, unsigned long nowMs = 0) {
   if (nowMs == 0) nowMs = millis();
-  bool outLed = false;
+  bool outLed  = false;
   bool outBuzz = false;
 
-  portENTER_CRITICAL(&g_hwNotifMux);
-  if (g_hwNotif.ledMode != 0 && nowMs >= g_hwNotif.ledUntilMs) {
-    g_hwNotif.ledMode = 0;
-    g_hwNotif.ledPinState = false;
-  }
+  {
+    CritSection cs(g_hwNotifMux);
+    NotifHardwareState &h = g_hwNotif;
 
-  if (g_hwNotif.ledMode == 1) {
-    outLed = true;
-  } else if (g_hwNotif.ledMode == 2) {
-    if ((nowMs - g_hwNotif.ledLastToggleMs) >= 120) {
-      g_hwNotif.ledLastToggleMs = nowMs;
-      g_hwNotif.ledPinState = !g_hwNotif.ledPinState;
+    if (h.ledMode != 0 && (nowMs - h.ledStartMs) >= h.ledDurationMs) {
+      h.ledMode     = 0;
+      h.ledPinState = false;
     }
-    outLed = g_hwNotif.ledPinState;
-  } else if (g_hwNotif.ledMode == 3) {
-    if ((nowMs - g_hwNotif.ledLastToggleMs) >= 450) {
-      g_hwNotif.ledLastToggleMs = nowMs;
-      g_hwNotif.ledPinState = !g_hwNotif.ledPinState;
+    if (h.ledMode == 1) {
+      outLed = true;
+    } else if (h.ledMode == 2 || h.ledMode == 3) {
+      const unsigned long halfPeriodMs = (h.ledMode == 2) ? 120 : 450;
+      if ((nowMs - h.ledLastToggleMs) >= halfPeriodMs) {
+        h.ledLastToggleMs = nowMs;
+        h.ledPinState     = !h.ledPinState;
+      }
+      outLed = h.ledPinState;
+    } else {
+      outLed = systemUnlockedOrEmg;
     }
-    outLed = g_hwNotif.ledPinState;
-  } else {
-    outLed = systemUnlockedOrEmg;
+
+    if (h.buzzPat != BUZZ_NONE) {
+      const BuzzSeq  &seq  = BUZZ_SEQS[h.buzzPat];
+      const BuzzStep &step = seq.steps[h.buzzStep];
+      outBuzz = step.on;
+      if ((nowMs - h.buzzStepStartMs) >= step.ms) {
+        if (h.buzzStep + 1 < seq.len) {
+          h.buzzStep++;
+          h.buzzStepStartMs = nowMs;
+        } else {
+          h.buzzPat  = BUZZ_NONE;
+          h.buzzStep = 0;
+          outBuzz    = false;
+        }
+      }
+    }
   }
 
-  BuzzerPattern pat = g_hwNotif.buzzPat;
-  uint8_t step = g_hwNotif.buzzStep;
-  unsigned long elapsed = nowMs - g_hwNotif.buzzStepStartMs;
-
-  if (pat == BUZZ_UNLOCK) {
-    if (step == 0) { outBuzz = true; if (elapsed >= 90)  { g_hwNotif.buzzStep = 1; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 1) { outBuzz = false; if (elapsed >= 60)  { g_hwNotif.buzzStep = 2; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 2) { outBuzz = true; if (elapsed >= 140) { g_hwNotif.buzzPat = BUZZ_NONE; g_hwNotif.buzzStep = 0; outBuzz = false; } }
-  } else if (pat == BUZZ_ENROLL_STEP) {
-    outBuzz = true;
-    if (elapsed >= 80) { g_hwNotif.buzzPat = BUZZ_NONE; g_hwNotif.buzzStep = 0; outBuzz = false; }
-  } else if (pat == BUZZ_ENROLL_OK) {
-    if (step == 0) { outBuzz = true; if (elapsed >= 80)  { g_hwNotif.buzzStep = 1; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 1) { outBuzz = false; if (elapsed >= 70)  { g_hwNotif.buzzStep = 2; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 2) { outBuzz = true; if (elapsed >= 80)  { g_hwNotif.buzzStep = 3; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 3) { outBuzz = false; if (elapsed >= 70)  { g_hwNotif.buzzStep = 4; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 4) { outBuzz = true; if (elapsed >= 180) { g_hwNotif.buzzPat = BUZZ_NONE; g_hwNotif.buzzStep = 0; outBuzz = false; } }
-  } else if (pat == BUZZ_ALERT) {
-    if (step == 0) { outBuzz = true; if (elapsed >= 120) { g_hwNotif.buzzStep = 1; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 1) { outBuzz = false; if (elapsed >= 90)  { g_hwNotif.buzzStep = 2; g_hwNotif.buzzStepStartMs = nowMs; } }
-    else if (step == 2) { outBuzz = true; if (elapsed >= 220) { g_hwNotif.buzzPat = BUZZ_NONE; g_hwNotif.buzzStep = 0; outBuzz = false; } }
-  } else if (pat == BUZZ_NOTIF) {
-    outBuzz = true;
-    if (elapsed >= 60) { g_hwNotif.buzzPat = BUZZ_NONE; g_hwNotif.buzzStep = 0; outBuzz = false; }
-  }
-  portEXIT_CRITICAL(&g_hwNotifMux);
-
-  setLedNotifPin(outLed);
-  setBuzzerTonePin(outBuzz);
+  digitalWrite(PIN_LED_NOTIF, outLed ? HIGH : LOW);
+  digitalWrite(PIN_BUZZER, outBuzz ? HIGH : LOW);
 }
 
 // ============================================================================
-// SENSOR SIDIK JARI R503 & PENDAFTARAN (ENROLL)
+// SENSOR SIDIK JARI R503 & STATE MACHINE ENROLL (EKSKLUSIF DI CORE 1)
 // ============================================================================
-int scanFingerprintOnce(uint16_t &outId, int &outConfidence) {
-  if (g_r503Mutex && xSemaphoreTake(g_r503Mutex, pdMS_TO_TICKS(150)) != pdTRUE) {
-    return -1;
-  }
+static void applyR503DefaultConfig() {
+  finger.setSecurityLevel(2);
+  finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE, 0);
+}
 
-  int result = -1;
+static void setWebEnrollState(WebEnrollStage st, uint16_t slot, const char* msg) {
+  CritSection cs(g_webEnrollMux);
+  g_webEnrollStage = st;
+  g_webTargetSlot  = slot;
+  copyStr(g_webEnrollMsg, msg);
+}
+
+static void setEnrollStatus(WebEnrollStage st, uint16_t slot, const char *webMsg, const char *lcdMsg, bool fullClear = false) {
+  setWebEnrollState(st, slot, webMsg);
+  setFingerStatus(lcdMsg, fullClear);
+}
+
+static bool enqueueEnrollCommand(EnrollCmdType type, uint16_t slotId = 0) {
+  if (g_enrollCmdQueue == nullptr) return false;
+  EnrollCommand cmd{type, slotId};
+  return (xQueueSend(g_enrollCmdQueue, &cmd, pdMS_TO_TICKS(20)) == pdTRUE);
+}
+
+static int scanFingerprintOnce(uint16_t &outId, int &outConfidence) {
+  ScopedLock lock(g_r503Mutex, 100);
+  if (!lock) return -1;
+
   if (!g_r503Ok.load(std::memory_order_acquire)) {
-    bool ok = finger.verifyPassword();
+    const bool ok = finger.verifyPassword();
     g_r503Ok.store(ok, std::memory_order_release);
     if (!ok) {
       g_lastR503Err.store(FINGERPRINT_PACKETRECIEVEERR, std::memory_order_release);
-      if (g_r503Mutex) xSemaphoreGive(g_r503Mutex);
       return -1;
     }
+    applyR503DefaultConfig();
     g_lastR503Err.store(0, std::memory_order_release);
   }
 
@@ -821,205 +1061,564 @@ int scanFingerprintOnce(uint16_t &outId, int &outConfidence) {
         g_r503Ok.store(false, std::memory_order_release);
       }
     }
-    result = -1;
-  } else {
-    p = finger.image2Tz(1);
-    if (p != FINGERPRINT_OK) {
-      g_lastR503Err.store(p, std::memory_order_release);
-      result = -2;
-    } else {
-      p = finger.fingerFastSearch();
-      if (p == FINGERPRINT_OK) {
-        g_lastR503Err.store(0, std::memory_order_release);
-        outId = finger.fingerID;
-        outConfidence = static_cast<int>(finger.confidence);
-        result = 0;
-      } else {
-        g_lastR503Err.store(p, std::memory_order_release);
-        result = -3;
-      }
-    }
+    return -1;
   }
 
-  if (g_r503Mutex) xSemaphoreGive(g_r503Mutex);
-  return result;
-}
-
-static bool findFreeFingerprintSlot(uint16_t &outId) {
-  for (uint16_t id = 1; id <= FINGER_MAX_SLOTS; id++) {
-    uint8_t p = finger.loadModel(id);
-    if (p != FINGERPRINT_OK) {
-      outId = id;
-      return true;
-    }
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) {
+    g_lastR503Err.store(p, std::memory_order_release);
+    return -1;
   }
-  return false;
+
+  p = finger.fingerSearch();
+  if (p == FINGERPRINT_OK) {
+    g_lastR503Err.store(0, std::memory_order_release);
+    outId = finger.fingerID;
+    outConfidence = static_cast<int>(finger.confidence);
+    finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 10, FINGERPRINT_LED_PURPLE, 2);
+    return 0;
+  }
+
+  g_lastR503Err.store(p, std::memory_order_release);
+  finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 10, FINGERPRINT_LED_RED, 2);
+  return -2;
 }
 
-bool enrollFingerprintNextSlot(uint16_t &enrolledId, char *statusMsg, size_t statusLen) {
-  char fallbackBuf[32] = "";
-  char *outPtr = (statusMsg && statusLen > 0) ? statusMsg : fallbackBuf;
-  size_t outCap = (statusMsg && statusLen > 0) ? statusLen : sizeof(fallbackBuf);
+enum EnrollFsmState : uint8_t {
+  ENROLL_IDLE = 0,
+  ENROLL_FIND_SLOT,
+  ENROLL_WAIT_FINGER_1,
+  ENROLL_WAIT_LIFT,
+  ENROLL_WAIT_FINGER_2
+};
 
-  auto setStat = [&](const char *m) {
-    strncpy(outPtr, m, outCap - 1);
-    outPtr[outCap - 1] = '\0';
-  };
+struct EnrollContext {
+  EnrollFsmState state;
+  uint16_t       scanSlotCursor;
+  uint16_t       targetSlot;
+  unsigned long  stepStartMs;
+  unsigned long  lastSlotProbeMs;
+};
 
-  if (g_r503Mutex && xSemaphoreTake(g_r503Mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
-    setStat("R503 SIBUK");
-    triggerLedAndBuzzer(2, 1000, BUZZ_ALERT);
+static EnrollContext g_enrollCtx = {ENROLL_IDLE, 1, 0, 0, 0};
+static constexpr uint16_t ENROLL_SLOTS_PER_TICK = 8;
+static constexpr unsigned long ENROLL_SLOT_PROBE_GAP_MS = 20;
+
+static void abortEnrollSession(const char *reasonMsg, unsigned long nowMs) {
+  g_enrollCtx.state = ENROLL_IDLE;
+  g_enrollCtx.scanSlotCursor = 1;
+  {
+    ScopedLock lock(g_r503Mutex, 50);
+    if (lock) finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE, 0);
+  }
+  setWebEnrollState(WEB_ENROLL_ERROR, 0, reasonMsg);
+  triggerLedAndBuzzer(2, 1200, BUZZ_ALERT, nowMs);
+  triggerPopup("ENROLL GAGAL", reasonMsg, TFT_RED, 1800);
+  setFingerStatus(reasonMsg, true);
+}
+
+static bool startEnrollSession(unsigned long nowMs) {
+  if (!isSystemUnlockedAtomic()) {
+    setWebEnrollState(WEB_ENROLL_ERROR, 0, "Buka kunci HUD dulu sebelum tambah");
     return false;
   }
 
-  auto finishEnroll = [&](bool ok, const char *msg, uint8_t ledMode, uint16_t ledDur, BuzzerPattern buzz) -> bool {
-    setStat(msg);
-    triggerLedAndBuzzer(ledMode, ledDur, buzz);
-    if (g_r503Mutex) xSemaphoreGive(g_r503Mutex);
-    return ok;
-  };
-
-  if (!g_r503Ok.load(std::memory_order_acquire)) {
-    bool ok = finger.verifyPassword();
-    g_r503Ok.store(ok, std::memory_order_release);
-    if (!ok) {
-      return finishEnroll(false, "R503 OFFLINE", 2, 1200, BUZZ_ALERT);
+  {
+    ScopedLock lock(g_r503Mutex, 100);
+    if (!lock) {
+      abortEnrollSession("R503 SIBUK", nowMs);
+      return false;
     }
-  }
-
-  uint16_t slotId = 0;
-  if (!findFreeFingerprintSlot(slotId)) {
-    return finishEnroll(false, "MEMORI PENUH", 2, 1200, BUZZ_ALERT);
-  }
-
-  unsigned long deadline = millis() + 4500;
-  setStat("TEMPEL JARI 1/2");
-  triggerPopup("ENROLL JARI 1/2", "TEMPELKAN JARI", TFT_YELLOW, 2200);
-  triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP);
-
-  uint8_t p = FINGERPRINT_NOFINGER;
-  while (millis() < deadline) {
-    esp_task_wdt_reset();
-    unsigned long loopNow = millis();
-    serviceLedAndBuzzer(isRelayAuthorizedAtomic(), loopNow);
-    applyRelayOutput(loopNow);
-    p = finger.getImage();
-    if (p == FINGERPRINT_OK) break;
-    if (p != FINGERPRINT_NOFINGER) {
-      return finishEnroll(false, "GAGAL SCAN #1", 2, 1000, BUZZ_ALERT);
+    if (!g_r503Ok.load(std::memory_order_acquire)) {
+      const bool ok = finger.verifyPassword();
+      g_r503Ok.store(ok, std::memory_order_release);
+      if (!ok) {
+        lock.release();
+        abortEnrollSession("R503 OFFLINE", nowMs);
+        return false;
+      }
+      applyR503DefaultConfig();
     }
-    vTaskDelay(pdMS_TO_TICKS(60));
-  }
-  if (p != FINGERPRINT_OK) {
-    return finishEnroll(false, "TIMEOUT JARI 1", 2, 1000, BUZZ_ALERT);
+    finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 25, FINGERPRINT_LED_RED, 0);
   }
 
-  if (finger.image2Tz(1) != FINGERPRINT_OK) {
-    return finishEnroll(false, "CONV GAGAL #1", 2, 1000, BUZZ_ALERT);
-  }
+  g_enrollCtx.state           = ENROLL_FIND_SLOT;
+  g_enrollCtx.scanSlotCursor  = 1;
+  g_enrollCtx.targetSlot      = 0;
+  g_enrollCtx.stepStartMs     = nowMs;
+  g_enrollCtx.lastSlotProbeMs = 0;
 
-  triggerLedAndBuzzer(1, 500, BUZZ_ENROLL_STEP);
-  setStat("ANGKAT JARI...");
-  triggerPopup("ANGKAT JARI", "TUNGGU SEBENTAR", TFT_CYAN, 2000);
-  unsigned long liftDeadline = millis() + 4000;
-  while (millis() < liftDeadline && finger.getImage() != FINGERPRINT_NOFINGER) {
-    esp_task_wdt_reset();
-    serviceLedAndBuzzer(isRelayAuthorizedAtomic(), millis());
-    vTaskDelay(pdMS_TO_TICKS(60));
-  }
-
-  deadline = millis() + 4500;
-  setStat("TEMPEL JARI 2/2");
-  triggerPopup("ENROLL JARI 2/2", "TEMPEL LAGI", TFT_YELLOW, 2200);
-  triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP);
-
-  p = FINGERPRINT_NOFINGER;
-  while (millis() < deadline) {
-    esp_task_wdt_reset();
-    unsigned long loopNow = millis();
-    serviceLedAndBuzzer(isRelayAuthorizedAtomic(), loopNow);
-    applyRelayOutput(loopNow);
-    p = finger.getImage();
-    if (p == FINGERPRINT_OK) break;
-    if (p != FINGERPRINT_NOFINGER) {
-      return finishEnroll(false, "GAGAL SCAN #2", 2, 1000, BUZZ_ALERT);
-    }
-    vTaskDelay(pdMS_TO_TICKS(60));
-  }
-  if (p != FINGERPRINT_OK) {
-    return finishEnroll(false, "TIMEOUT JARI 2", 2, 1000, BUZZ_ALERT);
-  }
-
-  if (finger.image2Tz(2) != FINGERPRINT_OK) {
-    return finishEnroll(false, "CONV GAGAL #2", 2, 1000, BUZZ_ALERT);
-  }
-
-  if (finger.createModel() != FINGERPRINT_OK) {
-    return finishEnroll(false, "JARI TDK COCOK", 2, 1200, BUZZ_ALERT);
-  }
-
-  if (finger.storeModel(slotId) != FINGERPRINT_OK) {
-    return finishEnroll(false, "SIMPAN GAGAL", 2, 1200, BUZZ_ALERT);
-  }
-
-  enrolledId = slotId;
-  snprintf(outPtr, outCap, "TERDAFTAR #%u", slotId);
-  triggerPopup("ENROLL SUKSES", outPtr, TFT_GREEN, 2000);
-  triggerLedAndBuzzer(1, 1500, BUZZ_ENROLL_OK);
-  if (g_r503Mutex) xSemaphoreGive(g_r503Mutex);
+  setEnrollStatus(WEB_ENROLL_FIND_SLOT, 0, "Mencari slot kosong di R503...", "CARI SLOT R503...");
+  triggerPopup("WEB ENROLL", "CARI SLOT KOSONG", TFT_CYAN, 1500);
+  triggerLedAndBuzzer(1, 800, BUZZ_ENROLL_STEP, nowMs);
   return true;
 }
 
+static const char *enrollTimeoutReason(EnrollFsmState st) {
+  switch (st) {
+    case ENROLL_FIND_SLOT:     return "TIMEOUT SLOT R503";
+    case ENROLL_WAIT_FINGER_1: return "TIMEOUT JARI 1";
+    case ENROLL_WAIT_LIFT:     return "TIMEOUT ANGKAT";
+    default:                   return "TIMEOUT JARI 2";
+  }
+}
+
+static void stepEnrollFindSlot(unsigned long nowMs) {
+  if ((nowMs - g_enrollCtx.lastSlotProbeMs) < ENROLL_SLOT_PROBE_GAP_MS) return;
+  g_enrollCtx.lastSlotProbeMs = nowMs;
+
+  bool foundFree = false;
+  bool exhausted = false;
+  uint16_t freeSlot = 0;
+  {
+    ScopedLock lock(g_r503Mutex, 50);
+    if (!lock) return;
+
+    for (uint16_t checked = 0; checked < ENROLL_SLOTS_PER_TICK && g_enrollCtx.scanSlotCursor <= FINGER_MAX_SLOTS; checked++) {
+      const uint16_t candidateId = g_enrollCtx.scanSlotCursor++;
+      if (finger.loadModel(candidateId) != FINGERPRINT_OK) {
+        freeSlot  = candidateId;
+        foundFree = true;
+        break;
+      }
+    }
+    exhausted = (!foundFree && g_enrollCtx.scanSlotCursor > FINGER_MAX_SLOTS);
+  }
+
+  if (foundFree) {
+    g_enrollCtx.state       = ENROLL_WAIT_FINGER_1;
+    g_enrollCtx.targetSlot  = freeSlot;
+    g_enrollCtx.stepStartMs = nowMs;
+
+    char msg[56];
+    snprintf(msg, sizeof(msg), "Tempelkan jari 1/2 (Slot #%u)", freeSlot);
+    setEnrollStatus(WEB_ENROLL_WAIT_FINGER_1, freeSlot, msg, "TEMPEL JARI 1/2");
+    triggerPopup("ENROLL JARI 1/2", "TEMPELKAN JARI", TFT_YELLOW, 2200);
+    triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP, nowMs);
+  } else if (exhausted) {
+    abortEnrollSession("MEMORI PENUH", nowMs);
+  }
+}
+
+static void stepEnrollCapture(unsigned long nowMs) {
+  ScopedLock lock(g_r503Mutex, 50);
+  if (!lock) return;
+
+  switch (g_enrollCtx.state) {
+    case ENROLL_WAIT_FINGER_1: {
+      const uint8_t p = finger.getImage();
+      if (p == FINGERPRINT_OK) {
+        if (finger.image2Tz(1) != FINGERPRINT_OK) {
+          lock.release();
+          abortEnrollSession("CONV GAGAL #1", nowMs);
+          return;
+        }
+        g_enrollCtx.state       = ENROLL_WAIT_LIFT;
+        g_enrollCtx.stepStartMs = nowMs;
+        finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0, 0);
+        lock.release();
+
+        setEnrollStatus(WEB_ENROLL_WAIT_LIFT, g_enrollCtx.targetSlot, "Angkat jari sebentar...", "ANGKAT JARI...");
+        triggerLedAndBuzzer(1, 500, BUZZ_ENROLL_STEP, nowMs);
+        triggerPopup("ANGKAT JARI", "TUNGGU SEBENTAR", TFT_CYAN, 2000);
+      } else if (p != FINGERPRINT_NOFINGER) {
+        lock.release();
+        abortEnrollSession("GAGAL SCAN #1", nowMs);
+      }
+      break;
+    }
+
+    case ENROLL_WAIT_LIFT: {
+      if (finger.getImage() == FINGERPRINT_NOFINGER) {
+        g_enrollCtx.state       = ENROLL_WAIT_FINGER_2;
+        g_enrollCtx.stepStartMs = nowMs;
+        finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 25, FINGERPRINT_LED_RED, 0);
+        lock.release();
+
+        char msg[56];
+        snprintf(msg, sizeof(msg), "Tempelkan jari 2/2 (Slot #%u)", g_enrollCtx.targetSlot);
+        setEnrollStatus(WEB_ENROLL_WAIT_FINGER_2, g_enrollCtx.targetSlot, msg, "TEMPEL JARI 2/2");
+        triggerPopup("ENROLL JARI 2/2", "TEMPEL LAGI", TFT_YELLOW, 2200);
+        triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP, nowMs);
+      }
+      break;
+    }
+
+    case ENROLL_WAIT_FINGER_2: {
+      const uint8_t p = finger.getImage();
+      if (p == FINGERPRINT_OK) {
+        if (finger.image2Tz(2) != FINGERPRINT_OK) {
+          lock.release();
+          abortEnrollSession("CONV GAGAL #2", nowMs);
+          return;
+        }
+        if (finger.createModel() != FINGERPRINT_OK) {
+          lock.release();
+          abortEnrollSession("JARI TDK COCOK", nowMs);
+          return;
+        }
+
+        const uint16_t readySlot = g_enrollCtx.targetSlot;
+        g_enrollCtx.state          = ENROLL_IDLE;
+        g_enrollCtx.scanSlotCursor = 1;
+        finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE, 0);
+        lock.release();
+
+        char readyMsg[56];
+        char lcdMsg[32];
+        snprintf(readyMsg, sizeof(readyMsg), "Scan cocok! Klik Simpan untuk Slot #%u", readySlot);
+        snprintf(lcdMsg, sizeof(lcdMsg), "SIAP SIMPAN #%u", readySlot);
+        setEnrollStatus(WEB_ENROLL_READY_TO_SAVE, readySlot, readyMsg, lcdMsg, true);
+        triggerPopup("SIAP SIMPAN", lcdMsg, TFT_CYAN, 2200);
+        triggerLedAndBuzzer(1, 1000, BUZZ_ENROLL_STEP, nowMs);
+      } else if (p != FINGERPRINT_NOFINGER) {
+        lock.release();
+        abortEnrollSession("GAGAL SCAN #2", nowMs);
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+static void stepEnrollSession(unsigned long nowMs) {
+  if (g_enrollCtx.state == ENROLL_IDLE) return;
+
+  if ((nowMs - g_enrollCtx.stepStartMs) >= ENROLL_STEP_TMO_MS) {
+    abortEnrollSession(enrollTimeoutReason(g_enrollCtx.state), nowMs);
+    return;
+  }
+
+  if (g_enrollCtx.state == ENROLL_FIND_SLOT) stepEnrollFindSlot(nowMs);
+  else                                        stepEnrollCapture(nowMs);
+}
+
+static bool saveEnrolledFingerprintToR503(unsigned long nowMs) {
+  WebEnrollStage st;
+  uint16_t slot;
+  {
+    CritSection cs(g_webEnrollMux);
+    st   = g_webEnrollStage;
+    slot = g_webTargetSlot;
+  }
+
+  if (st != WEB_ENROLL_READY_TO_SAVE || slot == 0) {
+    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Belum ada hasil scan yang siap disimpan");
+    return false;
+  }
+
+  uint8_t p;
+  {
+    ScopedLock lock(g_r503Mutex, 100);
+    if (!lock) {
+      setWebEnrollState(WEB_ENROLL_ERROR, slot, "R503 sibuk saat menyimpan");
+      return false;
+    }
+    p = finger.storeModel(slot);
+    if (p == FINGERPRINT_OK) {
+      finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 10, FINGERPRINT_LED_BLUE, 3);
+    }
+  }
+
+  if (p != FINGERPRINT_OK) {
+    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Gagal menyimpan ke memori R503");
+    triggerPopup("SIMPAN GAGAL", "CEK R503", TFT_RED, 1800);
+    triggerLedAndBuzzer(2, 1200, BUZZ_ALERT, nowMs);
+    return false;
+  }
+
+  char okWeb[56];
+  char okLcd[32];
+  snprintf(okWeb, sizeof(okWeb), "Tersimpan sukses di ID #%u", slot);
+  snprintf(okLcd, sizeof(okLcd), "TERSIMPAN #%u", slot);
+  setEnrollStatus(WEB_ENROLL_SAVED, slot, okWeb, okLcd, true);
+
+  triggerPopup("TERSIMPAN", okLcd, TFT_GREEN, 2000);
+  triggerLedAndBuzzer(1, 1500, BUZZ_ENROLL_OK, nowMs);
+  return true;
+}
+
+static bool deleteFingerprintSlotR503(uint16_t slotId, unsigned long nowMs) {
+  if (!isSystemUnlockedAtomic()) {
+    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Buka kunci HUD dulu sebelum hapus");
+    return false;
+  }
+  if (slotId == 0 || slotId > FINGER_MAX_SLOTS) {
+    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "ID harus antara 1 - 127");
+    return false;
+  }
+
+  uint8_t p;
+  {
+    ScopedLock lock(g_r503Mutex, 100);
+    if (!lock) {
+      setWebEnrollState(WEB_ENROLL_ERROR, slotId, "R503 sibuk saat menghapus");
+      return false;
+    }
+    p = finger.deleteModel(slotId);
+  }
+
+  if (p != FINGERPRINT_OK) {
+    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Gagal hapus ID (slot kosong/error)");
+    triggerPopup("HAPUS GAGAL", "CEK ID R503", TFT_RED, 1600);
+    triggerLedAndBuzzer(2, 1000, BUZZ_ALERT, nowMs);
+    return false;
+  }
+
+  char msg[56];
+  char lcdMsg[32];
+  snprintf(msg, sizeof(msg), "Sidik jari ID #%u dihapus", slotId);
+  snprintf(lcdMsg, sizeof(lcdMsg), "HAPUS ID #%u", slotId);
+  setWebEnrollState(WEB_ENROLL_IDLE, 0, msg);
+  triggerPopup("ID DIHAPUS", lcdMsg, TFT_CYAN, 1600);
+  triggerLedAndBuzzer(1, 800, BUZZ_ENROLL_STEP, nowMs);
+  return true;
+}
+
+static void serviceEnrollCommandsOnCore1(unsigned long nowMs) {
+  EnrollCommand cmd;
+  while (g_enrollCmdQueue && xQueueReceive(g_enrollCmdQueue, &cmd, 0) == pdTRUE) {
+    switch (cmd.type) {
+      case ENROLL_CMD_ADD:    startEnrollSession(nowMs); break;
+      case ENROLL_CMD_SAVE:   saveEnrolledFingerprintToR503(nowMs); break;
+      case ENROLL_CMD_DELETE: deleteFingerprintSlotR503(cmd.slotId, nowMs); break;
+      case ENROLL_CMD_ABORT:
+        if (g_enrollCtx.state != ENROLL_IDLE) abortEnrollSession("ENROLL DIBATALKAN", nowMs);
+        break;
+    }
+  }
+}
+
 // ============================================================================
-// KOMUNIKASI ESP-NOW TCI (CALLBACK RINGAN -> PROSES DI TASK CORE 0)
+// WEB SERVER AP (AKTIF 30 DETIK SAAT BOOT, OFF JIKA TIDAK TERHUBUNG HP)
 // ============================================================================
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-void onTciEspNowSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  (void)info;
-  portENTER_CRITICAL(&g_stateMux);
-  g_lastEspSendOk = (status == ESP_NOW_SEND_SUCCESS);
+static const char ENROLL_WEB_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Satria HUD - R503</title>
+  <style>
+    body{font-family:sans-serif;background:#0f1115;color:#f1f5f9;padding:16px;max-width:460px;margin:auto}
+    .box{background:#1b1f27;border:1px solid #2d3442;border-radius:10px;padding:14px;margin-bottom:12px}
+    h3{margin:0 0 10px 0;font-size:16px;color:#38bdf8}
+    button{padding:10px 14px;border:0;border-radius:8px;font-weight:bold;cursor:pointer;margin:4px 4px 4px 0}
+    button:disabled{opacity:0.4;cursor:not-allowed}
+    .btn-add{background:#22c55e;color:#052e16}
+    .btn-save{background:#3b82f6;color:#fff}
+    .btn-del{background:#ef4444;color:#fff}
+    input{padding:9px;border-radius:8px;border:1px solid #475569;background:#0f1115;color:#fff;width:85px}
+    .status{margin-top:8px;font-size:14px;color:#facc15;min-height:20px}
+  </style>
+</head>
+<body>
+  <h2>R503 Fingerprint Control</h2>
+  <div class="box">
+    <h3>Tambah &amp; Simpan Sidik Jari</h3>
+    <button class="btn-add" onclick="postCmd('/api/add')">Tambah</button>
+    <button class="btn-save" id="btnSave" onclick="postCmd('/api/save')" disabled>Simpan</button>
+    <div class="status" id="st">Memuat status...</div>
+  </div>
+  <div class="box">
+    <h3>Hapus Sidik Jari</h3>
+    <label>ID (1-127): <input type="number" id="slotId" min="1" max="127" value="1"></label>
+    <button class="btn-del" onclick="delId()">Hapus</button>
+  </div>
+<script>
+async function postCmd(url, body){
+  const r = await fetch(url, {method:'POST', body: body||''});
+  const txt = await r.text();
+  document.getElementById('st').innerText = txt;
+  pollStatus();
+}
+function delId(){
+  const id = document.getElementById('slotId').value;
+  postCmd('/api/delete', 'id=' + encodeURIComponent(id));
+}
+async function pollStatus(){
+  try{
+    const r = await fetch('/api/status');
+    if(!r.ok) return;
+    const j = await r.json();
+    document.getElementById('st').innerText = j.msg;
+    document.getElementById('btnSave').disabled = !j.canSave;
+  }catch(e){}
+}
+setInterval(pollStatus, 600);
+pollStatus();
+</script>
+</body>
+</html>
+)HTML";
+
+static void applyEspNowRadioParams(bool disconnectStaFirst) {
+  if (disconnectStaFirst) {
+    WiFi.disconnect(false, false);
+  }
+  esp_wifi_set_mac(WIFI_IF_STA, HUD_S3_CUSTOM_MAC);
+  esp_wifi_set_channel(TCI_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+}
+
+static void replyQueued(bool queued, const char *okMsg) {
+  g_webServer.send(queued ? 202 : 503, "text/plain", queued ? okMsg : "Antrean R503 penuh, coba lagi");
+}
+
+static void rejectWebRequest(uint16_t slot, const char *msg) {
+  setWebEnrollState(WEB_ENROLL_ERROR, slot, msg);
+  g_webServer.send(400, "text/plain", msg);
+}
+
+static void startBootEnrollWebServer() {
+  if (g_webServerActive.load(std::memory_order_acquire) || g_webServerExpired.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  g_webBootStartMs = millis();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP(WEB_AP_SSID, WEB_AP_PASS, TCI_WIFI_CHANNEL, false, 2);
+
+  g_webServer.on("/", HTTP_GET, []() {
+    g_webServer.send_P(200, "text/html", ENROLL_WEB_HTML);
+  });
+
+  g_webServer.on("/api/status", HTTP_GET, []() {
+    WebEnrollStage st;
+    uint16_t slot;
+    char msg[sizeof(g_webEnrollMsg)];
+    {
+      CritSection cs(g_webEnrollMux);
+      st   = g_webEnrollStage;
+      slot = g_webTargetSlot;
+      copyStr(msg, g_webEnrollMsg);
+    }
+
+    char safeMsg[120];
+    formatJsonEscaped(msg, safeMsg, sizeof(safeMsg));
+
+    char json[220];
+    snprintf(json, sizeof(json), "{\"stage\":%u,\"slot\":%u,\"canSave\":%s,\"msg\":\"%s\"}",
+             static_cast<unsigned int>(st),
+             static_cast<unsigned int>(slot),
+             (st == WEB_ENROLL_READY_TO_SAVE) ? "true" : "false",
+             safeMsg);
+    g_webServer.send(200, "application/json", json);
+  });
+
+  g_webServer.on("/api/add", HTTP_POST, []() {
+    if (!isSystemUnlockedAtomic()) {
+      rejectWebRequest(0, "Buka kunci HUD dulu sebelum tambah");
+      return;
+    }
+    replyQueued(enqueueEnrollCommand(ENROLL_CMD_ADD, 0), "Perintah tambah dikirim ke R503...");
+  });
+
+  g_webServer.on("/api/save", HTTP_POST, []() {
+    replyQueued(enqueueEnrollCommand(ENROLL_CMD_SAVE, 0), "Menyimpan sidik jari ke R503...");
+  });
+
+  g_webServer.on("/api/delete", HTTP_POST, []() {
+    if (!g_webServer.hasArg("id")) {
+      g_webServer.send(400, "text/plain", "ID slot wajib diisi");
+      return;
+    }
+    const uint16_t slotId = static_cast<uint16_t>(g_webServer.arg("id").toInt());
+    if (!isSystemUnlockedAtomic()) {
+      rejectWebRequest(slotId, "Buka kunci HUD dulu sebelum hapus");
+      return;
+    }
+    if (slotId == 0 || slotId > FINGER_MAX_SLOTS) {
+      rejectWebRequest(slotId, "ID harus antara 1 - 127");
+      return;
+    }
+    replyQueued(enqueueEnrollCommand(ENROLL_CMD_DELETE, slotId), "Menghapus ID sidik jari...");
+  });
+
+  g_webServer.begin();
+  g_webServerActive.store(true, std::memory_order_release);
+}
+
+static void stopBootEnrollWebServer() {
+  if (!g_webServerActive.load(std::memory_order_acquire)) return;
+
+  g_webServer.stop();
+  WiFi.softAPdisconnect(true);
+  if (!g_tciEspNowReady.load(std::memory_order_acquire)) {
+    WiFi.mode(WIFI_OFF);
+  } else {
+    WiFi.mode(WIFI_STA);
+    applyEspNowRadioParams(false);
+  }
+
+  g_webServerActive.store(false, std::memory_order_release);
+  g_webServerExpired.store(true, std::memory_order_release);
+  setWebEnrollState(WEB_ENROLL_IDLE, 0, "Web server nonaktif (batas 30 detik)");
+}
+
+static void serviceBootEnrollWebServer(unsigned long nowMs) {
+  if (!g_webServerActive.load(std::memory_order_acquire)) return;
+
+  g_webServer.handleClient();
+
+  if ((nowMs - g_webBootStartMs) >= WEB_BOOT_WINDOW_MS && WiFi.softAPgetStationNum() == 0) {
+    stopBootEnrollWebServer();
+  }
+}
+
+// ============================================================================
+// KOMUNIKASI ESP-NOW TCI
+// ============================================================================
+static void recordEspSendResult(bool ok) {
+  CritSection cs(g_stateMux);
+  g_lastEspSendOk = ok;
   g_espSendCbSeen = true;
-  portEXIT_CRITICAL(&g_stateMux);
+}
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+static void onTciEspNowSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  (void)info;
+  recordEspSendResult(status == ESP_NOW_SEND_SUCCESS);
 }
 #else
-void onTciEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+static void onTciEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   (void)mac_addr;
-  portENTER_CRITICAL(&g_stateMux);
-  g_lastEspSendOk = (status == ESP_NOW_SEND_SUCCESS);
-  g_espSendCbSeen = true;
-  portEXIT_CRITICAL(&g_stateMux);
+  recordEspSendResult(status == ESP_NOW_SEND_SUCCESS);
 }
 #endif
 
-static void syncPendingEspNowPeer() {
-  if (!g_tciEspNowReady.load(std::memory_order_acquire)) return;
-  bool hasPending = false;
-  uint8_t macCopy[6] = {0};
-
-  portENTER_CRITICAL(&g_stateMux);
-  if (g_newPeerPending) {
-    hasPending = true;
-    memcpy(macCopy, g_pendingPeerMac, 6);
-    g_newPeerPending = false;
-  }
-  portEXIT_CRITICAL(&g_stateMux);
-
-  if (hasPending) {
-    if (!esp_now_is_peer_exist(macCopy)) {
-      esp_now_peer_info_t peer = {};
-      memcpy(peer.peer_addr, macCopy, 6);
-      peer.channel = TCI_WIFI_CHANNEL;
-      peer.encrypt = false;
-      esp_err_t addErr = esp_now_add_peer(&peer);
-      if (addErr != ESP_OK) {
-        g_diagTxFail.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-    saveC3MacToNvs(macCopy);
-  }
+static esp_err_t addEspNowPeer(const uint8_t mac[6]) {
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, mac, 6);
+  peer.channel = TCI_WIFI_CHANNEL;
+  peer.encrypt = false;
+  return esp_now_add_peer(&peer);
 }
 
-bool sendModePacket(uint8_t mode) {
+static void syncPendingEspNowPeer() {
+  if (!g_tciEspNowReady.load(std::memory_order_acquire)) return;
+
+  bool hasPending = false;
+  uint8_t macCopy[6] = {0};
+  {
+    CritSection cs(g_stateMux);
+    if (g_newPeerPending) {
+      hasPending = true;
+      memcpy(macCopy, g_pendingPeerMac, 6);
+      g_newPeerPending = false;
+    }
+  }
+  if (!hasPending) return;
+
+  if (!esp_now_is_peer_exist(macCopy) && addEspNowPeer(macCopy) != ESP_OK) {
+    g_diagTxFail.fetch_add(1, std::memory_order_relaxed);
+  }
+  saveC3MacToNvs(macCopy);
+}
+
+static bool sendModePacket(uint8_t mode) {
   if (!isUnlockedAndOnTciPage() || !g_tciEspNowReady.load(std::memory_order_acquire)) {
     return false;
   }
@@ -1030,31 +1629,32 @@ bool sendModePacket(uint8_t mode) {
   cmd.crc16         = calculateCRC16(reinterpret_cast<const uint8_t*>(&cmd), sizeof(CommandData) - sizeof(uint16_t));
 
   uint8_t destMac[6];
-  portENTER_CRITICAL(&g_stateMux);
-  g_espSendCbSeen = false;
-  g_lastEspSendOk = false;
-  memcpy(destMac, g_c3MacLocked ? activeC3PeerMac : DEFAULT_C3_MAC, 6);
-  portEXIT_CRITICAL(&g_stateMux);
+  {
+    CritSection cs(g_stateMux);
+    g_espSendCbSeen = false;
+    g_lastEspSendOk = false;
+    memcpy(destMac, g_c3MacLocked ? activeC3PeerMac : DEFAULT_C3_MAC, 6);
+  }
 
-  esp_err_t res = esp_now_send(destMac, reinterpret_cast<const uint8_t*>(&cmd), sizeof(CommandData));
+  const esp_err_t res = esp_now_send(destMac, reinterpret_cast<const uint8_t*>(&cmd), sizeof(CommandData));
   if (res != ESP_OK) {
     g_diagTxFail.fetch_add(1, std::memory_order_relaxed);
-    Serial.printf("[ESP-NOW] Gagal kirim mode (%d)\n", static_cast<int>(res));
   }
-  unsigned long nowMs = millis();
 
-  portENTER_CRITICAL(&g_stateMux);
-  g_lastModeSendMs = nowMs;
-  portEXIT_CRITICAL(&g_stateMux);
+  const unsigned long nowMs = millis();
+  {
+    CritSection cs(g_stateMux);
+    g_lastModeSendMs = nowMs;
+  }
   return (res == ESP_OK);
 }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-void onTciEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+static void onTciEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
   if (!info || !info->src_addr || !incomingData) return;
   const uint8_t *mac = info->src_addr;
 #else
-void onTciEspNowRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+static void onTciEspNowRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   if (!mac || !incomingData) return;
 #endif
   if (!g_tciRxEnabled.load(std::memory_order_acquire)) return;
@@ -1069,146 +1669,213 @@ void onTciEspNowRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
   xQueueSend(g_espNowRxQueue, &frame, 0);
 }
 
+static bool acceptTciPeer(const uint8_t srcMac[6]) {
+  bool accepted = false;
+  CritSection cs(g_stateMux);
+  if (!STRICT_C3_PEER_LOCK || !g_c3MacLocked) {
+    if (memcmp(activeC3PeerMac, srcMac, 6) != 0) {
+      if (ALLOW_INITIAL_C3_LEARN || !g_c3MacLocked) {
+        memcpy(activeC3PeerMac, srcMac, 6);
+        memcpy(g_pendingPeerMac, srcMac, 6);
+        g_newPeerPending = true;
+        accepted = true;
+      }
+    } else {
+      accepted = true;
+    }
+    if (STRICT_C3_PEER_LOCK && accepted) {
+      g_c3MacLocked = true;
+    }
+  } else {
+    accepted = (memcmp(activeC3PeerMac, srcMac, 6) == 0);
+  }
+  return accepted;
+}
+
 static void processIncomingEspNowFrames() {
   if (g_espNowRxQueue == nullptr) return;
 
   EspNowRawFrame frame;
   while (xQueueReceive(g_espNowRxQueue, &frame, 0) == pdTRUE) {
-    if (!isUnlockedAndOnTciPage()) continue;
+    if (!g_tciRxEnabled.load(std::memory_order_acquire) || !isRelayAuthorizedAtomic()) continue;
     if (frame.len != static_cast<int>(sizeof(TelemetryData))) continue;
 
     const TelemetryData *pkt = reinterpret_cast<const TelemetryData*>(frame.payload);
     if (pkt->header != 0xAA55) continue;
 
-    uint16_t calcCrc = calculateCRC16(frame.payload, sizeof(TelemetryData) - sizeof(uint16_t));
-    if (pkt->crc16 != calcCrc) {
+    if (pkt->crc16 != calculateCRC16(frame.payload, sizeof(TelemetryData) - sizeof(uint16_t))) {
       g_diagCrcErr.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
 
-    bool peerAccepted = false;
-    portENTER_CRITICAL(&g_stateMux);
-    if (!STRICT_C3_PEER_LOCK || !g_c3MacLocked) {
-      if (memcmp(activeC3PeerMac, frame.srcMac, 6) != 0) {
-        if (ALLOW_INITIAL_C3_LEARN || !g_c3MacLocked) {
-          memcpy(activeC3PeerMac, frame.srcMac, 6);
-          memcpy(g_pendingPeerMac, frame.srcMac, 6);
-          g_newPeerPending = true;
-          peerAccepted = true;
-        }
-      } else {
-        peerAccepted = true;
-      }
-      if (STRICT_C3_PEER_LOCK && peerAccepted) {
-        g_c3MacLocked = true;
-      }
-    } else {
-      peerAccepted = (memcmp(activeC3PeerMac, frame.srcMac, 6) == 0);
-    }
-    portEXIT_CRITICAL(&g_stateMux);
-    if (!peerAccepted) {
+    if (!acceptTciPeer(frame.srcMac)) {
       g_diagMacDrop.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
 
-    int degClamped = constrain(static_cast<int>(pkt->degree10), 0, 350);
-    uint8_t mapped = static_cast<uint8_t>(map(degClamped, 0, 350, 0, 60));
+    const int degClamped = constrain(static_cast<int>(pkt->degree10), 0, 350);
+    const uint8_t mapped = static_cast<uint8_t>(map(degClamped, 0, 350, 0, 60));
 
-    portENTER_CRITICAL(&g_tciMux);
+    CritSection cs(g_tciMux);
     memcpy(&g_tciPkt, pkt, sizeof(TelemetryData));
     g_lastTciRxMs = frame.rxMs;
     g_tciRxSeq++;
     g_advHistory[g_advHistIdx] = mapped;
     g_advHistIdx = (g_advHistIdx + 1) % ADV_HIST_LEN;
-    portEXIT_CRITICAL(&g_tciMux);
   }
 }
 
-void initTciEspNowOnce() {
+static void initTciEspNowOnce() {
   if (g_tciEspNowReady.load(std::memory_order_acquire)) return;
 
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, false);
-  esp_wifi_set_mac(WIFI_IF_STA, HUD_S3_CUSTOM_MAC);
-  esp_wifi_set_channel(TCI_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  WiFi.mode(g_webServerActive.load(std::memory_order_acquire) ? WIFI_AP_STA : WIFI_STA);
+  applyEspNowRadioParams(true);
 
-  if (esp_now_init() == ESP_OK) {
-    esp_now_register_recv_cb(onTciEspNowRecv);
-    esp_now_register_send_cb(onTciEspNowSent);
+  if (esp_now_init() != ESP_OK) return;
 
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, DEFAULT_C3_MAC, 6);
-    peer.channel = TCI_WIFI_CHANNEL;
-    peer.encrypt = false;
-    bool basePeerOk = (esp_now_add_peer(&peer) == ESP_OK);
+  esp_now_register_recv_cb(onTciEspNowRecv);
+  esp_now_register_send_cb(onTciEspNowSent);
 
-    uint8_t savedMac[6];
-    bool hasLocked = false;
-    portENTER_CRITICAL(&g_stateMux);
+  const bool basePeerOk = (addEspNowPeer(DEFAULT_C3_MAC) == ESP_OK);
+
+  uint8_t savedMac[6];
+  bool hasLocked;
+  {
+    CritSection cs(g_stateMux);
     hasLocked = g_c3MacLocked;
     memcpy(savedMac, activeC3PeerMac, 6);
-    portEXIT_CRITICAL(&g_stateMux);
+  }
+  if (hasLocked && memcmp(savedMac, DEFAULT_C3_MAC, 6) != 0 && !esp_now_is_peer_exist(savedMac)) {
+    addEspNowPeer(savedMac);
+  }
 
-    if (hasLocked && memcmp(savedMac, DEFAULT_C3_MAC, 6) != 0 && !esp_now_is_peer_exist(savedMac)) {
-      esp_now_peer_info_t savedPeer = {};
-      memcpy(savedPeer.peer_addr, savedMac, 6);
-      savedPeer.channel = TCI_WIFI_CHANNEL;
-      savedPeer.encrypt = false;
-      esp_now_add_peer(&savedPeer);
-    }
-
-    if (basePeerOk) {
-      g_tciEspNowReady.store(true, std::memory_order_release);
-    } else {
-      esp_now_deinit();
-    }
+  if (basePeerOk) {
+    g_tciEspNowReady.store(true, std::memory_order_release);
+  } else {
+    esp_now_deinit();
   }
 }
 
-void setTciGateForPage(bool onTciPage) {
+static void syncTelemetryGate(PageId page) {
+  const bool onTciPage = (page == PAGE_TCI);
+
   if (!onTciPage) {
-    portENTER_CRITICAL(&g_stateMux);
+    CritSection cs(g_stateMux);
     g_pendingModeChange = false;
     g_newPeerPending    = false;
-    portEXIT_CRITICAL(&g_stateMux);
   }
-  g_tciRxEnabled.store(onTciPage, std::memory_order_release);
+
+  g_tciRxEnabled.store(isRelayAuthorizedAtomic(), std::memory_order_release);
   g_allowChronosNotif.store(!onTciPage, std::memory_order_release);
 }
 
 // ============================================================================
-// PARSER NAVIGASI & NOTIFIKASI CHRONOS
+// SINKRONISASI RTC, NAVIGASI & NOTIFIKASI CHRONOS
 // ============================================================================
+static void syncRtcFromChronos() {
+  static bool wasChronosConnected = false;
+
+  const bool connected = watch.isConnected();
+  if (!connected) {
+    wasChronosConnected = false;
+    return;
+  }
+
+  const bool justConnected = !wasChronosConnected;
+  wasChronosConnected = true;
+
+  const int year   = watch.getYear();
+  const int month  = watch.getMonth() + 1;
+  const int day    = watch.getDay();
+  const int hour   = watch.getHour();
+  const int minute = watch.getMinute();
+  const int second = watch.getSecond();
+
+  if (year < 2024 || year > 2099 ||
+      month < 1 || month > 12 ||
+      day < 1 || day > 31 ||
+      hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 ||
+      second < 0 || second > 59) {
+    return;
+  }
+
+  const DateTime chronosDt(
+    static_cast<uint16_t>(year),
+    static_cast<uint8_t>(month),
+    static_cast<uint8_t>(day),
+    static_cast<uint8_t>(hour),
+    static_cast<uint8_t>(minute),
+    static_cast<uint8_t>(second)
+  );
+
+  if (!g_rtcOk.load(std::memory_order_acquire)) return;
+
+  bool needAdjust = justConnected || g_rtcLostPower.load(std::memory_order_acquire);
+  {
+    ScopedLock lock(g_i2cMutex, 100);
+    if (!lock) return;
+
+    if (!needAdjust) {
+      const DateTime rtcNow = rtc.now();
+      if (rtcNow.year() >= 2020 && rtcNow.year() <= 2099) {
+        const int32_t diffSec = static_cast<int32_t>(chronosDt.unixtime()) - static_cast<int32_t>(rtcNow.unixtime());
+        if (diffSec > 2 || diffSec < -2) {
+          needAdjust = true;
+        }
+      } else {
+        needAdjust = true;
+      }
+    }
+
+    if (needAdjust) {
+      rtc.adjust(chronosDt);
+      g_rtcLostPower.store(false, std::memory_order_release);
+    }
+  }
+
+  if (needAdjust) {
+    updateRtcCache();
+    updateAdaptiveBacklight();
+  }
+}
+
+struct NavKeywordRule {
+  NavTurnType        turn;
+  const char *const *words;
+  uint8_t            count;
+};
+
+template <size_t N>
+static constexpr NavKeywordRule makeRule(NavTurnType t, const char *const (&w)[N]) {
+  return {t, w, static_cast<uint8_t>(N)};
+}
+
+static constexpr const char *KW_ARRIVE[]      = {"arrive", "destination", "tiba", "tujuan", "sampai"};
+static constexpr const char *KW_U_TURN[]      = {"u-turn", "uturn", "u turn", "putar balik", "balik arah"};
+static constexpr const char *KW_ROUNDABOUT[]  = {"roundabout", "rotary", "bundaran"};
+static constexpr const char *KW_SLIGHT_LEFT[] = {"slight left", "keep left", "serong kiri", "ambil kiri", "tetap di kiri"};
+static constexpr const char *KW_SLIGHT_RIGHT[]= {"slight right", "keep right", "serong kanan", "ambil kanan", "tetap di kanan"};
+static constexpr const char *KW_LEFT[]        = {"left", "kiri"};
+static constexpr const char *KW_RIGHT[]       = {"right", "kanan"};
+
+static constexpr NavKeywordRule NAV_RULES[] = {
+  makeRule(NAV_TURN_ARRIVE,       KW_ARRIVE),
+  makeRule(NAV_TURN_U_TURN,       KW_U_TURN),
+  makeRule(NAV_TURN_ROUNDABOUT,   KW_ROUNDABOUT),
+  makeRule(NAV_TURN_SLIGHT_LEFT,  KW_SLIGHT_LEFT),
+  makeRule(NAV_TURN_SLIGHT_RIGHT, KW_SLIGHT_RIGHT),
+  makeRule(NAV_TURN_LEFT,         KW_LEFT),
+  makeRule(NAV_TURN_RIGHT,        KW_RIGHT),
+};
+
 static NavTurnType classifyNavTurnFromText(const char *dirText, const char *titleText) {
   const char *parts[2] = {dirText ? dirText : "", titleText ? titleText : ""};
-  for (int p = 0; p < 2; p++) {
-    const char *s = parts[p];
-    if (containsIgnoreCase(s, "arrive") || containsIgnoreCase(s, "destination") ||
-        containsIgnoreCase(s, "tiba") || containsIgnoreCase(s, "tujuan") || containsIgnoreCase(s, "sampai")) {
-      return NAV_TURN_ARRIVE;
-    }
-    if (containsIgnoreCase(s, "u-turn") || containsIgnoreCase(s, "uturn") || containsIgnoreCase(s, "u turn") ||
-        containsIgnoreCase(s, "putar balik") || containsIgnoreCase(s, "balik arah")) {
-      return NAV_TURN_U_TURN;
-    }
-    if (containsIgnoreCase(s, "roundabout") || containsIgnoreCase(s, "rotary") ||
-        containsIgnoreCase(s, "bundaran")) {
-      return NAV_TURN_ROUNDABOUT;
-    }
-    if (containsIgnoreCase(s, "slight left") || containsIgnoreCase(s, "keep left") ||
-        containsIgnoreCase(s, "serong kiri") || containsIgnoreCase(s, "ambil kiri") || containsIgnoreCase(s, "tetap di kiri")) {
-      return NAV_TURN_SLIGHT_LEFT;
-    }
-    if (containsIgnoreCase(s, "slight right") || containsIgnoreCase(s, "keep right") ||
-        containsIgnoreCase(s, "serong kanan") || containsIgnoreCase(s, "ambil kanan") || containsIgnoreCase(s, "tetap di kanan")) {
-      return NAV_TURN_SLIGHT_RIGHT;
-    }
-    if (containsIgnoreCase(s, "left") || containsIgnoreCase(s, "kiri")) {
-      return NAV_TURN_LEFT;
-    }
-    if (containsIgnoreCase(s, "right") || containsIgnoreCase(s, "kanan")) {
-      return NAV_TURN_RIGHT;
+  for (const char *text : parts) {
+    for (const NavKeywordRule &rule : NAV_RULES) {
+      for (uint8_t i = 0; i < rule.count; i++) {
+        if (containsIgnoreCase(text, rule.words[i])) return rule.turn;
+      }
     }
   }
   return NAV_TURN_STRAIGHT;
@@ -1219,6 +1886,7 @@ static bool isDistanceToken(const char *s, char *outBuf, size_t outSize) {
   size_t len = strlen(s);
   for (size_t i = 0; i < len; i++) {
     if (isdigit(static_cast<unsigned char>(s[i]))) {
+      if (i > 0 && isalpha(static_cast<unsigned char>(s[i - 1]))) continue;
       const char *p = s + i;
       const char *endNum = p;
       while (*endNum && (isdigit(static_cast<unsigned char>(*endNum)) || *endNum == '.' || *endNum == ',')) {
@@ -1260,8 +1928,9 @@ static uint32_t parseDistanceMeters(const char *distText) {
   bool hasVal = false;
   char numBuf[16];
   size_t nIdx = 0;
-  for (size_t i = 0; distText[i] != '\0' && nIdx < sizeof(numBuf) - 1; i++) {
-    char c = distText[i];
+  size_t pos = 0;
+  for (; distText[pos] != '\0' && nIdx < sizeof(numBuf) - 1; pos++) {
+    char c = distText[pos];
     if (isdigit(static_cast<unsigned char>(c)) || c == '.') {
       numBuf[nIdx++] = c;
       hasVal = true;
@@ -1277,7 +1946,9 @@ static uint32_t parseDistanceMeters(const char *distText) {
   val = atof(numBuf);
   if (val < 0.0) return 999999999UL;
 
-  bool isKm = containsIgnoreCase(distText, "km");
+  while (distText[pos] == ' ') pos++;
+  bool isKm = (tolower(static_cast<unsigned char>(distText[pos])) == 'k' &&
+               tolower(static_cast<unsigned char>(distText[pos + 1])) == 'm');
   if (isKm) {
     return static_cast<uint32_t>(val * 1000.0);
   }
@@ -1309,60 +1980,68 @@ static const char* navTurnDefaultLabel(NavTurnType t) {
   }
 }
 
+static inline bool isNumChar(char ch) {
+  return isdigit(static_cast<unsigned char>(ch)) || ch == '.' || ch == ',';
+}
+
+static bool findSpeedNumber(const char *c, char *outBuf, size_t outSize) {
+  static constexpr const char *units[3] = {"km/h", "km/j", "kpj"};
+  const int len = static_cast<int>(strlen(c));
+
+  for (const char *unit : units) {
+    const size_t uLen = strlen(unit);
+    for (int p = 1; p < len; p++) {
+      bool match = true;
+      for (size_t k = 0; k < uLen; k++) {
+        if (c[p + k] == '\0' || tolower(static_cast<unsigned char>(c[p + k])) != unit[k]) {
+          match = false;
+          break;
+        }
+      }
+      if (!match || isalpha(static_cast<unsigned char>(c[p + uLen]))) continue;
+
+      int endI = p - 1;
+      while (endI >= 0 && c[endI] == ' ') endI--;
+      int startI = endI;
+      bool hasDigit = false;
+      while (startI >= 0 && isNumChar(c[startI])) {
+        if (isdigit(static_cast<unsigned char>(c[startI]))) hasDigit = true;
+        startI--;
+      }
+      startI++;
+      while (startI <= endI && (c[startI] == '.' || c[startI] == ',')) startI++;
+      while (endI >= startI && (c[endI] == '.' || c[endI] == ',')) endI--;
+
+      if (hasDigit && endI >= startI) {
+        char numBuf[10];
+        size_t nLen = static_cast<size_t>(endI - startI + 1);
+        if (nLen >= sizeof(numBuf)) nLen = sizeof(numBuf) - 1;
+        memcpy(numBuf, c + startI, nLen);
+        numBuf[nLen] = '\0';
+        for (size_t m = 0; m < nLen; m++) {
+          if (numBuf[m] == ',') numBuf[m] = '.';
+        }
+        snprintf(outBuf, outSize, "%s KM/J", numBuf);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 static void extractSpeedInfo(const char *speedSrc, const char *titleSrc, const char *dirSrc, char *outBuf, size_t outSize) {
   const char *cands[3] = {speedSrc, titleSrc, dirSrc};
   for (int i = 0; i < 3; i++) {
     const char *c = cands[i];
     if (!c || c[0] == '\0') continue;
 
-    const char *units[3] = {"km/h", "km/j", "kpj"};
-    for (int u = 0; u < 3; u++) {
-      const char *p = c;
-      while (*p != '\0') {
-        const char *q = p;
-        size_t uLen = strlen(units[u]);
-        bool match = true;
-        for (size_t k = 0; k < uLen; k++) {
-          if (q[k] == '\0' || tolower(static_cast<unsigned char>(q[k])) != units[u][k]) {
-            match = false;
-            break;
-          }
-        }
-        if (match && q > c) {
-          const char *endNum = q - 1;
-          while (endNum >= c && *endNum == ' ') endNum--;
-          const char *startNum = endNum;
-          bool hasDigit = false;
-          while (startNum >= c && (isdigit(static_cast<unsigned char>(*startNum)) || *startNum == '.' || *startNum == ',')) {
-            if (isdigit(static_cast<unsigned char>(*startNum))) hasDigit = true;
-            startNum--;
-          }
-          startNum++;
-          while (startNum <= endNum && (*startNum == '.' || *startNum == ',')) startNum++;
-          while (endNum >= startNum && (*endNum == '.' || *endNum == ',')) endNum--;
-
-          if (hasDigit && endNum >= startNum) {
-            size_t nLen = static_cast<size_t>(endNum - startNum + 1);
-            char numBuf[10];
-            if (nLen >= sizeof(numBuf)) nLen = sizeof(numBuf) - 1;
-            memcpy(numBuf, startNum, nLen);
-            numBuf[nLen] = '\0';
-            for (size_t m = 0; m < nLen; m++) {
-              if (numBuf[m] == ',') numBuf[m] = '.';
-            }
-            snprintf(outBuf, outSize, "%s KM/J", numBuf);
-            return;
-          }
-        }
-        p++;
-      }
-    }
+    if (findSpeedNumber(c, outBuf, outSize)) return;
 
     if (i == 0) {
       bool validNum = true;
       bool hasDigit = false;
       for (size_t k = 0; c[k] != '\0'; k++) {
-        unsigned char ch = static_cast<unsigned char>(c[k]);
+        const unsigned char ch = static_cast<unsigned char>(c[k]);
         if (isdigit(ch)) {
           hasDigit = true;
         } else if (ch != '.' && ch != ',') {
@@ -1379,119 +2058,76 @@ static void extractSpeedInfo(const char *speedSrc, const char *titleSrc, const c
   snprintf(outBuf, outSize, "-- KM/J");
 }
 
-void updateNavFromChronos() {
-  bool bleConn = watch.isConnected();
-  Navigation nav = watch.getNavigation();
-  unsigned long nowMs = millis();
+static bool navContentEqual(const NavTelemetryData &a, const NavTelemetryData &b) {
+  return a.bleConnected == b.bleConnected && a.navActive == b.navActive && a.turn == b.turn &&
+         strcmp(a.turnLabel, b.turnLabel) == 0 && strcmp(a.distance, b.distance) == 0 &&
+         strcmp(a.speedInfo, b.speedInfo) == 0 && strcmp(a.roadName, b.roadName) == 0 &&
+         strcmp(a.etaInfo, b.etaInfo) == 0 && strcmp(a.durationInfo, b.durationInfo) == 0;
+}
 
-  char dirBuf[48]   = "";
-  char titleBuf[48] = "";
-  char distBuf[20]  = "";
-  char etaBuf[28]   = "";
-  char durBuf[22]   = "";
-  char spdRaw[20]   = "";
+static void updateNavFromChronos() {
+  const bool bleConn = watch.isConnected();
+  const Navigation nav = watch.getNavigation();
 
-  if (bleConn && nav.active) {
-    strncpy(dirBuf, nav.directions.c_str(), sizeof(dirBuf) - 1);
-    dirBuf[sizeof(dirBuf) - 1] = '\0';
-    sanitizeAsciiInPlace(dirBuf);
-    trimAsciiInPlace(dirBuf);
-
-    strncpy(titleBuf, nav.title.c_str(), sizeof(titleBuf) - 1);
-    titleBuf[sizeof(titleBuf) - 1] = '\0';
-    sanitizeAsciiInPlace(titleBuf);
-    trimAsciiInPlace(titleBuf);
-
-    strncpy(distBuf, nav.distance.c_str(), sizeof(distBuf) - 1);
-    distBuf[sizeof(distBuf) - 1] = '\0';
-    sanitizeAsciiInPlace(distBuf);
-    trimAsciiInPlace(distBuf);
-
-    strncpy(etaBuf, nav.eta.c_str(), sizeof(etaBuf) - 1);
-    etaBuf[sizeof(etaBuf) - 1] = '\0';
-    sanitizeAsciiInPlace(etaBuf);
-    trimAsciiInPlace(etaBuf);
-
-    strncpy(durBuf, nav.duration.c_str(), sizeof(durBuf) - 1);
-    durBuf[sizeof(durBuf) - 1] = '\0';
-    sanitizeAsciiInPlace(durBuf);
-    trimAsciiInPlace(durBuf);
-
-    strncpy(spdRaw, nav.speed.c_str(), sizeof(spdRaw) - 1);
-    spdRaw[sizeof(spdRaw) - 1] = '\0';
-    sanitizeAsciiInPlace(spdRaw);
-    trimAsciiInPlace(spdRaw);
+  if (!(bleConn && nav.active)) {
+    CritSection cs(g_navMux);
+    const bool changed = (g_navData.bleConnected != bleConn) || g_navData.navActive;
+    g_navData.bleConnected = bleConn;
+    g_navData.navActive    = false;
+    if (changed) g_navData.seq++;
+    return;
   }
+
+  char dirBuf[48];
+  char titleBuf[48];
+  char distBuf[20];
+  char etaBuf[28];
+  char durBuf[22];
+  char spdRaw[20];
+  copyCleanAscii(dirBuf,   nav.directions.c_str());
+  copyCleanAscii(titleBuf, nav.title.c_str());
+  copyCleanAscii(distBuf,  nav.distance.c_str());
+  copyCleanAscii(etaBuf,   nav.eta.c_str());
+  copyCleanAscii(durBuf,   nav.duration.c_str());
+  copyCleanAscii(spdRaw,   nav.speed.c_str());
 
   NavTelemetryData nextNav;
   memset(&nextNav, 0, sizeof(nextNav));
   nextNav.bleConnected = bleConn;
+  nextNav.navActive    = true;
+  nextNav.turn         = classifyNavTurnFromText(dirBuf, titleBuf);
+  copyStr(nextNav.turnLabel, navTurnDefaultLabel(nextNav.turn));
 
-  if (bleConn && nav.active) {
-    NavTurnType tType = classifyNavTurnFromText(dirBuf, titleBuf);
-    nextNav.navActive = true;
-    nextNav.turn      = tType;
-
-    strncpy(nextNav.turnLabel, navTurnDefaultLabel(tType), sizeof(nextNav.turnLabel) - 1);
-    nextNav.turnLabel[sizeof(nextNav.turnLabel) - 1] = '\0';
-
-    char parsedDist[16] = "";
-    const char* distSrc = "--";
-    if (distBuf[0] != '\0') {
-      if (isDistanceToken(distBuf, parsedDist, sizeof(parsedDist))) {
-        distSrc = parsedDist;
-      } else {
-        distSrc = distBuf;
-      }
-    } else if (isDistanceToken(dirBuf, parsedDist, sizeof(parsedDist)) ||
-               isDistanceToken(titleBuf, parsedDist, sizeof(parsedDist))) {
-      distSrc = parsedDist;
-    }
-    strncpy(nextNav.distance, distSrc, sizeof(nextNav.distance) - 1);
-    nextNav.distance[sizeof(nextNav.distance) - 1] = '\0';
-
-    const char* roadSrc = (dirBuf[0] != '\0') ? dirBuf
-                        : ((titleBuf[0] != '\0') ? titleBuf : "Ikuti Rute GMaps");
-    strncpy(nextNav.roadName, roadSrc, sizeof(nextNav.roadName) - 1);
-    nextNav.roadName[sizeof(nextNav.roadName) - 1] = '\0';
-
-    const char* etaSrc = (etaBuf[0] != '\0') ? etaBuf : "--";
-    strncpy(nextNav.etaInfo, etaSrc, sizeof(nextNav.etaInfo) - 1);
-    nextNav.etaInfo[sizeof(nextNav.etaInfo) - 1] = '\0';
-
-    const char* durSrc = (durBuf[0] != '\0') ? durBuf : "--";
-    strncpy(nextNav.durationInfo, durSrc, sizeof(nextNav.durationInfo) - 1);
-    nextNav.durationInfo[sizeof(nextNav.durationInfo) - 1] = '\0';
-
-    extractSpeedInfo(spdRaw, titleBuf, dirBuf, nextNav.speedInfo, sizeof(nextNav.speedInfo));
-    nextNav.lastRxMs = nowMs;
+  char parsedDist[16] = "";
+  const char *distSrc = "--";
+  if (distBuf[0] != '\0') {
+    distSrc = isDistanceToken(distBuf, parsedDist, sizeof(parsedDist)) ? parsedDist : distBuf;
+  } else if (isDistanceToken(dirBuf, parsedDist, sizeof(parsedDist)) ||
+             isDistanceToken(titleBuf, parsedDist, sizeof(parsedDist))) {
+    distSrc = parsedDist;
   }
+  copyStr(nextNav.distance, distSrc);
 
-  portENTER_CRITICAL(&g_navMux);
-  uint32_t prevSeq = g_navData.seq;
-  bool prevBle = g_navData.bleConnected;
-  bool prevAct = g_navData.navActive;
-  if (bleConn && nav.active) {
-    nextNav.seq = prevSeq + 1;
-    g_navData = nextNav;
-  } else {
-    g_navData.bleConnected = bleConn;
-    g_navData.navActive = false;
-    if (prevBle != bleConn || prevAct != false) {
-      g_navData.seq = prevSeq + 1;
-    }
-  }
-  portEXIT_CRITICAL(&g_navMux);
+  copyStr(nextNav.roadName, (dirBuf[0] != '\0')   ? dirBuf
+                          : (titleBuf[0] != '\0') ? titleBuf : "Ikuti Rute GMaps");
+  copyStr(nextNav.etaInfo,      (etaBuf[0] != '\0') ? etaBuf : "--");
+  copyStr(nextNav.durationInfo, (durBuf[0] != '\0') ? durBuf : "--");
+  extractSpeedInfo(spdRaw, titleBuf, dirBuf, nextNav.speedInfo, sizeof(nextNav.speedInfo));
+  nextNav.lastRxMs = millis();
+
+  CritSection cs(g_navMux);
+  nextNav.seq = g_navData.seq;
+  if (!navContentEqual(nextNav, g_navData)) nextNav.seq++;
+  g_navData = nextNav;
 }
 
-void pollChronosNotification() {
+static void pollChronosNotification() {
   if (!g_allowChronosNotif.load(std::memory_order_acquire)) return;
 
   static char lastSig[164] = "";
   static bool wasBleConn = false;
 
-  bool bleConn = watch.isConnected();
-  if (!bleConn) {
+  if (!watch.isConnected()) {
     if (wasBleConn) {
       lastSig[0] = '\0';
       wasBleConn = false;
@@ -1500,59 +2136,42 @@ void pollChronosNotification() {
   }
   wasBleConn = true;
 
-  Notification n = watch.getNotificationAt(0);
+  const Notification n = watch.getNotificationAt(0);
   char appBuf[24];
   char titleBuf[32];
   char msgBuf[104];
-
-  strncpy(appBuf, n.app.c_str(), sizeof(appBuf) - 1);
-  appBuf[sizeof(appBuf) - 1] = '\0';
-  sanitizeAsciiInPlace(appBuf);
-  trimAsciiInPlace(appBuf);
-
-  strncpy(titleBuf, n.title.c_str(), sizeof(titleBuf) - 1);
-  titleBuf[sizeof(titleBuf) - 1] = '\0';
-  sanitizeAsciiInPlace(titleBuf);
-  trimAsciiInPlace(titleBuf);
-
-  strncpy(msgBuf, n.message.c_str(), sizeof(msgBuf) - 1);
-  msgBuf[sizeof(msgBuf) - 1] = '\0';
-  sanitizeAsciiInPlace(msgBuf, false);
-  trimAsciiInPlace(msgBuf);
+  copyCleanAscii(appBuf,   n.app.c_str());
+  copyCleanAscii(titleBuf, n.title.c_str());
+  copyCleanAscii(msgBuf,   n.message.c_str(), false);
 
   if (appBuf[0] == '\0' && titleBuf[0] == '\0' && msgBuf[0] == '\0') return;
 
-  char sig[164];
+  char sig[sizeof(lastSig)];
   snprintf(sig, sizeof(sig), "%s|%s|%s", appBuf, titleBuf, msgBuf);
   if (strcmp(sig, lastSig) == 0) return;
-  memcpy(lastSig, sig, sizeof(lastSig));
+  copyStr(lastSig, sig);
 
-  unsigned long nowMs = millis();
   NotifPopupData nextNotif;
   memset(&nextNotif, 0, sizeof(nextNotif));
-  strncpy(nextNotif.app, appBuf[0] != '\0' ? appBuf : "NOTIF", sizeof(nextNotif.app) - 1);
-  nextNotif.app[sizeof(nextNotif.app) - 1] = '\0';
-
-  strncpy(nextNotif.title, titleBuf, sizeof(nextNotif.title) - 1);
-  nextNotif.title[sizeof(nextNotif.title) - 1] = '\0';
-
-  strncpy(nextNotif.message, msgBuf, sizeof(nextNotif.message) - 1);
-  nextNotif.message[sizeof(nextNotif.message) - 1] = '\0';
-
+  copyStr(nextNotif.app, appBuf[0] != '\0' ? appBuf : "NOTIF");
+  copyStr(nextNotif.title, titleBuf);
+  copyStr(nextNotif.message, msgBuf);
+  const unsigned long nowMs = millis();
   nextNotif.startMs    = nowMs;
   nextNotif.durationMs = NOTIF_POPUP_MS;
   nextNotif.active     = true;
 
-  portENTER_CRITICAL(&g_notifMux);
-  nextNotif.seq = g_notifPopup.seq + 1;
-  g_notifPopup = nextNotif;
-  portEXIT_CRITICAL(&g_notifMux);
+  {
+    CritSection cs(g_notifMux);
+    nextNotif.seq = g_notifPopup.seq + 1;
+    g_notifPopup  = nextNotif;
+  }
 
   triggerLedAndBuzzer(2, 1500, BUZZ_NOTIF, nowMs);
 }
 
 // ============================================================================
-// TRANSISI & RENDERING UI LCD (RESPONSIF UNTUK BERKENDARA HARIAN)
+// TRANSISI & RENDERING UI LCD
 // ============================================================================
 enum UiTransitionMode : uint8_t {
   UI_TRANS_NONE = 0,
@@ -1566,17 +2185,32 @@ struct UiTransitionState {
   unsigned long    lastStepMs;
   uint16_t         stepDelayMs;
   bool             exitDone;
+  BootState        targetBoot;
+  PageId           targetPage;
+  uint8_t          targetSub;
 };
 
-static UiTransitionState g_uiTrans = {false, UI_TRANS_NONE, 0, 0, 8, false};
+static UiTransitionState g_uiTrans = {
+  false, UI_TRANS_NONE, 0, 0, 8, false, BOOT_WAIT_FINGERPRINT, PAGE_HOME, 0
+};
 
-static void startComponentTransition(uint16_t stepDelayMs = 8) {
+static void resetUiTransition() {
+  g_uiTrans.active   = false;
+  g_uiTrans.mode     = UI_TRANS_NONE;
+  g_uiTrans.step     = 0;
+  g_uiTrans.exitDone = false;
+}
+
+static void startComponentTransition(BootState bState, PageId page, uint8_t subPage, uint16_t stepDelayMs = 8) {
   g_uiTrans.active      = true;
   g_uiTrans.mode        = UI_TRANS_EXIT_ENTER;
   g_uiTrans.step        = 0;
   g_uiTrans.lastStepMs  = millis();
   g_uiTrans.stepDelayMs = stepDelayMs;
   g_uiTrans.exitDone    = false;
+  g_uiTrans.targetBoot  = bState;
+  g_uiTrans.targetPage  = page;
+  g_uiTrans.targetSub   = subPage;
 }
 
 static void drawAccentSweep(int y, uint16_t color, int progress0To320) {
@@ -1587,97 +2221,143 @@ static void drawAccentSweep(int y, uint16_t color, int progress0To320) {
 
 static void animateExitComponents(uint8_t exitPhase) {
   if (exitPhase == 0) {
-    lcd.fillRect(0, 0, 320, 120, TFT_BLACK);
-    drawAccentSweep(120, TFT_CYAN, 200);
+    lcd.fillRect(0, 0, 320, 85, TFT_BLACK);
+    drawAccentSweep(85, TFT_CYAN, 200);
   } else {
-    lcd.fillRect(0, 120, 320, 120, TFT_BLACK);
+    lcd.fillRect(0, 85, 320, 85, TFT_BLACK);
   }
 }
 
 static void animateEnterComponentStage(uint8_t enterStage) {
   if (enterStage == 0) {
-    lcd.drawFastHLine(0, 26, 320, TFT_CYAN);
+    lcd.drawFastHLine(0, 24, 320, TFT_CYAN);
   } else if (enterStage == 1) {
-    lcd.drawFastHLine(8, 112, 304, 0x2104);
+    lcd.drawFastHLine(8, 86, 304, COL_FRAME);
   } else {
-    lcd.drawFastHLine(0, 206, 320, TFT_DARKGREY);
+    lcd.drawFastHLine(0, 152, 320, TFT_DARKGREY);
   }
 }
 
-void drawTopBar(const char* title, bool relayOn, bool emgBypass = false) {
-  lcd.fillRect(0, 0, 320, 26, TFT_NAVY);
-  lcd.drawFastHLine(0, 26, 320, TFT_CYAN);
+static void drawTopBar(const char* title, bool relayOn, bool emgBypass = false) {
+  GfxBatch batch;
+  lcd.fillRect(0, 0, 320, 23, TFT_NAVY);
+  lcd.drawFastHLine(0, 23, 320, TFT_CYAN);
   lcd.setTextColor(TFT_WHITE, TFT_NAVY);
   lcd.setTextSize(2);
-  lcd.setCursor(10, 5);
+  lcd.setCursor(8, 4);
   lcd.print(title);
 
   lcd.setTextSize(1);
   if (emgBypass) {
     lcd.setTextColor(TFT_ORANGE, TFT_NAVY);
-    lcd.setCursor(225, 9);
+    lcd.setCursor(228, 8);
     lcd.print("EMG: BYPASS");
   } else {
     lcd.setTextColor(relayOn ? TFT_GREEN : TFT_RED, TFT_NAVY);
-    lcd.setCursor(235, 9);
+    lcd.setCursor(236, 8);
     lcd.print(relayOn ? "RELAY: ON " : "RELAY: OFF");
   }
 }
 
-void drawTciPopup(const char* line1, const char* line2, uint16_t bgColor) {
-  lcd.fillRect(60, 75, 200, 82, bgColor);
-  lcd.drawRect(64, 79, 192, 74, TFT_BLACK);
+static void buildTickerText(char *out, size_t outSize, const char *dBuf, bool rtcOk, bool rtcLostPower, const char *fBuf) {
+  const char *rtcInfo = !rtcOk ? "NO RTC" : (rtcLostPower ? "SET JAM" : "RTC OK");
+  snprintf(out, outSize, "TGL: %s (%s)  |  JARI: %s   ***   ", dBuf, rtcInfo, fBuf);
+}
+
+static void drawHomeTopBarWithTicker(bool baseRedraw, bool relayOn, bool emgBypass, const char* tickerText, int tickerOffset) {
+  GfxBatch batch;
+  if (baseRedraw) {
+    lcd.fillRect(0, 0, 320, 23, TFT_NAVY);
+    lcd.drawFastHLine(0, 23, 320, TFT_CYAN);
+
+    lcd.setTextColor(TFT_WHITE, TFT_NAVY);
+    lcd.setTextSize(2);
+    lcd.setCursor(6, 4);
+    lcd.print("HOME");
+
+    lcd.setTextSize(1);
+    if (emgBypass) {
+      lcd.setTextColor(TFT_ORANGE, TFT_NAVY);
+      lcd.setCursor(246, 8);
+      lcd.print("EMG:BYPASS");
+    } else {
+      lcd.setTextColor(relayOn ? TFT_GREEN : TFT_RED, TFT_NAVY);
+      lcd.setCursor(252, 8);
+      lcd.print(relayOn ? "RELAY:ON " : "RELAY:OFF");
+    }
+  }
+
+  constexpr int winChars = 29;
+  char winBuf[winChars + 1];
+  int srcLen = static_cast<int>(strlen(tickerText));
+  if (srcLen <= 0) {
+    memset(winBuf, ' ', winChars);
+  } else {
+    for (int i = 0; i < winChars; i++) {
+      int idx = (tickerOffset + i) % srcLen;
+      winBuf[i] = tickerText[idx];
+    }
+  }
+  winBuf[winChars] = '\0';
+
+  lcd.setTextSize(1);
+  lcd.setTextColor(TFT_YELLOW, TFT_NAVY);
+  lcd.setCursor(62, 8);
+  lcd.print(winBuf);
+}
+
+static void drawTciPopup(const char* line1, const char* line2, uint16_t bgColor) {
+  GfxBatch batch;
+  lcd.fillRect(45, 44, 230, 82, bgColor);
+  lcd.drawRect(49, 48, 222, 74, TFT_BLACK);
   lcd.setTextColor(TFT_BLACK, bgColor);
   lcd.setTextSize(2);
-  lcd.setCursor(76, 88);
+  lcd.setCursor(60, 58);
   lcd.print(line1);
-  lcd.setCursor(76, 118);
+  lcd.setCursor(60, 88);
   lcd.print(line2);
 }
 
-void drawNotifPopup(const NotifPopupData &n) {
-  const int boxX = 14, boxY = 34, boxW = 292, boxH = 174;
+static void drawNotifPopup(const NotifPopupData &n) {
+  GfxBatch batch;
+  const int boxX = 12, boxY = 26, boxW = 296, boxH = 138;
   uint16_t hdrCol = TFT_NAVY;
-  if (containsIgnoreCase(n.app, "whatsapp") || containsIgnoreCase(n.app, "wa")) {
+  if (containsIgnoreCase(n.app, "wa")) {
     hdrCol = TFT_DARKGREEN;
   }
 
   lcd.fillRoundRect(boxX, boxY, boxW, boxH, 6, TFT_BLACK);
   lcd.drawRoundRect(boxX, boxY, boxW, boxH, 6, TFT_CYAN);
-  lcd.fillRect(boxX + 2, boxY + 2, boxW - 4, 24, hdrCol);
+  lcd.fillRect(boxX + 2, boxY + 2, boxW - 4, 20, hdrCol);
 
   lcd.setTextSize(1);
   lcd.setTextColor(TFT_WHITE, hdrCol);
-  lcd.setCursor(boxX + 10, boxY + 10);
+  lcd.setCursor(boxX + 8, boxY + 7);
   lcd.printf("APP: %-24s", n.app);
 
   lcd.setTextSize(2);
   lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-  lcd.setCursor(boxX + 10, boxY + 34);
-  char tClip[22];
-  strncpy(tClip, n.title, 21);
-  tClip[21] = '\0';
-  lcd.printf("%-21s", tClip);
+  lcd.setCursor(boxX + 8, boxY + 27);
+  char tClip[23];
+  copyStr(tClip, n.title);
+  lcd.printf("%-22s", tClip);
 
-  lcd.drawFastHLine(boxX + 8, boxY + 56, boxW - 16, TFT_DARKGREY);
+  lcd.drawFastHLine(boxX + 8, boxY + 46, boxW - 16, TFT_DARKGREY);
 
   lcd.setTextSize(2);
   lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  const int maxCharsPerLine = 21;
+  const int maxCharsPerLine = 22;
   int msgLen = static_cast<int>(strlen(n.message));
   int pos = 0;
 
   for (int row = 0; row < 3; row++) {
-    while (pos < msgLen && (n.message[pos] == ' ' || n.message[pos] == '\r')) {
-      pos++;
-    }
-    if (pos < msgLen && n.message[pos] == '\n') {
+    while (pos < msgLen && (n.message[pos] == ' ' || n.message[pos] == '\r' || n.message[pos] == '\n')) {
       pos++;
     }
 
-    char line[22];
-    memset(line, ' ', 21);
-    line[21] = '\0';
+    char line[23];
+    memset(line, ' ', 22);
+    line[22] = '\0';
 
     int len = 0;
     int lastSpace = -1;
@@ -1685,57 +2365,58 @@ void drawNotifPopup(const NotifPopupData &n) {
 
     while (scanPos < msgLen && len < maxCharsPerLine) {
       char ch = n.message[scanPos];
-      if (ch == '\n' || ch == '\r') break;
+      if (ch == '\r' || ch == '\n') break;
       if (ch == ' ') lastSpace = len;
       line[len++] = ch;
       scanPos++;
     }
 
     int lineChars = len;
-    if (scanPos < msgLen && n.message[scanPos] != '\n' && n.message[scanPos] != '\r' && lastSpace > 0) {
+    if (scanPos < msgLen && n.message[scanPos] != '\r' && n.message[scanPos] != '\n' && lastSpace > 0) {
       lineChars = lastSpace;
       pos += lastSpace + 1;
     } else {
       pos = scanPos;
-      if (pos < msgLen && n.message[pos] == '\n') pos++;
+      if (pos < msgLen && (n.message[pos] == '\r' || n.message[pos] == '\n')) pos++;
     }
 
-    for (int k = lineChars; k < 21; k++) {
+    for (int k = lineChars; k < 22; k++) {
       line[k] = ' ';
     }
 
-    lcd.setCursor(boxX + 10, boxY + 66 + (row * 28));
+    lcd.setCursor(boxX + 8, boxY + 54 + (row * 25));
     lcd.print(line);
   }
 }
 
-void renderBootLockScreen(bool fullClear, bool emgBypass, bool r503Ok, uint8_t lastR503Err, bool rtcOk, bool rtcLostPower, uint8_t enterStage = 255) {
+static void renderBootLockScreen(bool fullClear, bool emgBypass, bool r503Ok, uint8_t lastR503Err, bool rtcOk, bool rtcLostPower, uint8_t enterStage = 255) {
+  GfxBatch batch;
   if (fullClear) {
     lcd.fillScreen(TFT_BLACK);
   }
 
   if (fullClear || enterStage == 0 || enterStage == 255) {
-    lcd.drawRoundRect(4, 4, 312, 232, 6, TFT_CYAN);
+    lcd.drawRoundRect(4, 3, 312, 164, 6, TFT_CYAN);
     lcd.setTextSize(2);
     lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-    lcd.setCursor(18, 26);
+    lcd.setCursor(16, 12);
     lcd.print("IMMOBILIZER R503");
-    lcd.drawFastHLine(18, 50, 284, TFT_DARKGREY);
+    lcd.drawFastHLine(16, 32, 288, TFT_DARKGREY);
   }
 
   if (fullClear || enterStage == 1 || enterStage == 255) {
     lcd.setTextSize(2);
     lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-    lcd.setCursor(18, 66);
-    lcd.print("Tempelkan jari pada R503");
-    lcd.setCursor(18, 94);
+    lcd.setCursor(16, 40);
+    lcd.print("Jari / GW4 (3M7H) dekat");
+    lcd.setCursor(16, 62);
     lcd.print("untuk ON Relay & Sistem ");
   }
 
   if (fullClear || enterStage >= 2 || enterStage == 255) {
     lcd.setTextSize(1);
     lcd.setTextColor(r503Ok ? TFT_GREEN : TFT_RED, TFT_BLACK);
-    lcd.setCursor(18, 144);
+    lcd.setCursor(16, 92);
     if (r503Ok) {
       lcd.print("Status R503: TERHUBUNG            ");
     } else {
@@ -1743,7 +2424,7 @@ void renderBootLockScreen(bool fullClear, bool emgBypass, bool r503Ok, uint8_t l
     }
 
     lcd.setTextColor(rtcOk ? (rtcLostPower ? TFT_YELLOW : TFT_GREEN) : TFT_RED, TFT_BLACK);
-    lcd.setCursor(18, 162);
+    lcd.setCursor(16, 108);
     if (!rtcOk) {
       lcd.print("Status RTC : TIDAK TERDETEKSI     ");
     } else if (rtcLostPower) {
@@ -1754,129 +2435,163 @@ void renderBootLockScreen(bool fullClear, bool emgBypass, bool r503Ok, uint8_t l
 
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
-    lcd.setCursor(18, 188);
+    lcd.setCursor(16, 128);
     lcd.print("Emergency (GPIO2): Tahan 3.5s ON Relay");
 
     lcd.setTextColor(emgBypass ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(18, 208);
+    lcd.setCursor(16, 146);
     lcd.print(emgBypass ? "RELAY: ON (EMERGENCY BYPASS AKTIF)  "
-                        : "RELAY: OFF (CORE 1 SECURITY ACTIVE) ");
+                        : "RELAY: OFF (SCAN JARI & GW4 AKTIF)  ");
   }
 }
 
-void renderPageHome(bool fullClear, bool relayOn, bool emgBypass, bool rtcOk, bool rtcLostPower, const char* tBuf, const char* dBuf, const char* fBuf, float chipTempC, uint8_t enterStage = 255) {
+static void renderPageHome(
+  bool fullClear,
+  bool relayOn,
+  bool emgBypass,
+  bool rtcOk,
+  bool rtcLostPower,
+  const char* tBuf,
+  const char* dBuf,
+  const char* fBuf,
+  float chipTempC,
+  bool tciOnline,
+  uint16_t battVolt10,
+  int16_t ntcTemp10,
+  int tickerOffset,
+  uint8_t enterStage = 255
+) {
+  GfxBatch batch;
   if (fullClear) {
     lcd.fillScreen(TFT_BLACK);
-    drawTopBar("1. HOME", relayOn, emgBypass);
   }
+
+  char tickerText[96];
+  buildTickerText(tickerText, sizeof(tickerText), dBuf, rtcOk, rtcLostPower, fBuf);
+
+  drawHomeTopBarWithTicker(fullClear || enterStage == 0 || enterStage == 255, relayOn, emgBypass, tickerText, tickerOffset);
 
   if (fullClear || enterStage == 0 || enterStage == 255) {
-    drawTopBar("1. HOME", relayOn, emgBypass);
-    lcd.drawRoundRect(8, 32, 304, 72, 5, 0x2104);
+    lcd.drawRoundRect(6, 28, 168, 96, 6, COL_FRAME);
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_SILVER, TFT_BLACK);
+    lcd.setCursor(14, 34);
+    lcd.print("JAM");
+
+    lcd.drawRoundRect(180, 28, 134, 96, 6, COL_FRAME);
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_SILVER, TFT_BLACK);
+    lcd.setCursor(188, 34);
+    lcd.print("AKI / VOLT");
   }
 
-  if (fullClear || enterStage == 1 || enterStage == 255) {
-    lcd.drawRoundRect(8, 108, 304, 64, 5, 0x2104);
-    lcd.setTextSize(2);
-    lcd.setTextColor(emgBypass ? TFT_ORANGE : TFT_GREEN, TFT_BLACK);
-    lcd.setCursor(14, 114);
-    lcd.printf("ID JARI: %-14s", fBuf);
+  if (fullClear || enterStage == 0 || enterStage == 1 || enterStage == 255) {
+    char hhmm[6];
+    copyStr(hhmm, tBuf);
 
-    lcd.setTextColor(rtcOk ? (rtcLostPower ? TFT_ORANGE : TFT_YELLOW) : TFT_RED, TFT_BLACK);
-    lcd.setCursor(14, 144);
-    if (!rtcOk) {
-      lcd.print("RTC: NO RTC           ");
-    } else if (rtcLostPower) {
-      lcd.print("RTC: SET ULANG JAM    ");
+    lcd.setTextSize(4);
+    lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+    lcd.setCursor(14, 56);
+    lcd.print(hhmm);
+
+    lcd.setTextSize(2);
+    lcd.setTextColor(TFT_SILVER, TFT_BLACK);
+    lcd.setCursor(138, 68);
+    lcd.print(strlen(tBuf) >= 8 ? (tBuf + 6) : "00");
+
+    if (!tciOnline) {
+      lcd.setTextSize(4);
+      lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      lcd.setCursor(186, 56);
+      lcd.print("--.-V");
     } else {
-      lcd.print("RTC: DS3231 OK        ");
+      uint16_t voltCol = (battVolt10 < BATT_MIN_WARN_10 || battVolt10 > BATT_MAX_WARN_10) ? TFT_RED : TFT_GREEN;
+      lcd.setTextSize(4);
+      lcd.setTextColor(voltCol, TFT_BLACK);
+      lcd.setCursor(186, 56);
+      lcd.printf("%4.1fV", battVolt10 / 10.0f);
     }
   }
 
   if (fullClear || enterStage >= 2 || enterStage == 255) {
-    lcd.setTextSize(1);
-    lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(14, 208);
-    lcd.print("1x Tekan: Halaman Berikutnya (1 -> 2 -> 3)");
-    lcd.setCursor(14, 222);
-    lcd.print("Tahan 3s: Buka Jok (Lepas = Relay OFF)");
-  }
+    lcd.drawRoundRect(6, 130, 308, 36, 5, COL_FRAME);
+    lcd.drawFastVLine(160, 132, 32, TFT_DARKGREY);
 
-  if (fullClear || enterStage == 0 || enterStage == 255) {
-    lcd.setTextSize(3);
-    lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-    lcd.setCursor(14, 38);
-    lcd.printf("%-8s", tBuf);
-
+    uint16_t chipCol = (chipTempC >= 75.0f) ? TFT_RED : ((chipTempC >= 55.0f) ? TFT_YELLOW : TFT_CYAN);
     lcd.setTextSize(2);
-    lcd.setTextColor(TFT_SILVER, TFT_BLACK);
-    lcd.setCursor(14, 74);
-    lcd.printf("%-12s", dBuf);
-
-    uint16_t tempCol = (chipTempC >= 75.0f) ? TFT_RED : ((chipTempC >= 55.0f) ? TFT_ORANGE : TFT_CYAN);
-    lcd.setTextSize(2);
-    lcd.setTextColor(tempCol, TFT_BLACK);
-    lcd.setCursor(192, 42);
+    lcd.setTextColor(chipCol, TFT_BLACK);
+    lcd.setCursor(14, 141);
     lcd.printf("MCU:%4.1fC", chipTempC);
+
+    if (!tciOnline) {
+      lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      lcd.setCursor(170, 141);
+      lcd.print("MESIN:--C ");
+    } else {
+      uint16_t ntcCol = (ntcTemp10 >= ENG_TEMP_WARN_10) ? TFT_RED : ((ntcTemp10 > 900) ? TFT_YELLOW : TFT_ORANGE);
+      lcd.setTextColor(ntcCol, TFT_BLACK);
+      lcd.setCursor(170, 141);
+      lcd.printf("MESIN:%3.0fC", ntcTemp10 / 10.0f);
+    }
   }
 }
 
-void drawNavTurnIcon(int cx, int cy, NavTurnType turn, uint16_t col) {
-  lcd.fillRect(cx - 34, cy - 34, 68, 68, TFT_BLACK);
-  lcd.drawRoundRect(cx - 34, cy - 34, 68, 68, 8, TFT_DARKGREY);
+static void drawNavTurnIcon(int cx, int cy, NavTurnType turn, uint16_t col) {
+  lcd.fillRect(cx - 25, cy - 25, 50, 50, TFT_BLACK);
+  lcd.drawRoundRect(cx - 25, cy - 25, 50, 50, 6, TFT_DARKGREY);
 
   switch (turn) {
     case NAV_TURN_LEFT:
-      lcd.fillRect(cx - 6, cy - 6, 18, 22, col);
-      lcd.fillRect(cx - 12, cy - 10, 24, 8, col);
-      lcd.fillTriangle(cx - 24, cy - 6, cx - 10, cy - 18, cx - 10, cy + 6, col);
+      lcd.fillRect(cx - 4, cy - 4, 14, 16, col);
+      lcd.fillRect(cx - 9, cy - 8, 19, 6, col);
+      lcd.fillTriangle(cx - 18, cy - 5, cx - 7, cy - 14, cx - 7, cy + 4, col);
       break;
     case NAV_TURN_RIGHT:
-      lcd.fillRect(cx - 12, cy - 6, 18, 22, col);
-      lcd.fillRect(cx - 12, cy - 10, 24, 8, col);
-      lcd.fillTriangle(cx + 24, cy - 6, cx + 10, cy - 18, cx + 10, cy + 6, col);
+      lcd.fillRect(cx - 10, cy - 4, 14, 16, col);
+      lcd.fillRect(cx - 10, cy - 8, 19, 6, col);
+      lcd.fillTriangle(cx + 18, cy - 5, cx + 7, cy - 14, cx + 7, cy + 4, col);
       break;
     case NAV_TURN_SLIGHT_LEFT:
-      lcd.drawLine(cx + 10, cy + 18, cx - 14, cy - 14, col);
-      lcd.fillTriangle(cx - 20, cy - 20, cx - 6, cy - 16, cx - 16, cy - 6, col);
+      lcd.drawLine(cx + 8, cy + 14, cx - 10, cy - 10, col);
+      lcd.fillTriangle(cx - 15, cy - 15, cx - 4, cy - 12, cx - 12, cy - 4, col);
       break;
     case NAV_TURN_SLIGHT_RIGHT:
-      lcd.drawLine(cx - 10, cy + 18, cx + 14, cy - 14, col);
-      lcd.fillTriangle(cx + 20, cy - 20, cx + 6, cy - 16, cx + 16, cy - 6, col);
+      lcd.drawLine(cx - 8, cy + 14, cx + 10, cy - 10, col);
+      lcd.fillTriangle(cx + 15, cy - 15, cx + 4, cy - 12, cx + 12, cy - 4, col);
       break;
     case NAV_TURN_U_TURN:
-      lcd.drawArc(cx + 4, cy + 2, 14, 14, 180, 360, col);
-      lcd.drawFastVLine(cx + 18, cy + 2, 16, col);
-      lcd.drawFastVLine(cx - 10, cy + 2, 10, col);
-      lcd.fillTriangle(cx - 10, cy + 22, cx - 17, cy + 12, cx - 3, cy + 12, col);
+      lcd.drawArc(cx + 3, cy + 1, 10, 10, 180, 360, col);
+      lcd.drawFastVLine(cx + 13, cy + 1, 12, col);
+      lcd.drawFastVLine(cx - 7, cy + 1, 8, col);
+      lcd.fillTriangle(cx - 7, cy + 16, cx - 13, cy + 8, cx - 1, cy + 8, col);
       break;
     case NAV_TURN_ROUNDABOUT:
-      lcd.drawCircle(cx, cy + 2, 14, col);
-      lcd.fillTriangle(cx, cy - 22, cx - 8, cy - 10, cx + 8, cy - 10, col);
+      lcd.drawCircle(cx, cy + 1, 10, col);
+      lcd.fillTriangle(cx, cy - 17, cx - 6, cy - 8, cx + 6, cy - 8, col);
       break;
     case NAV_TURN_ARRIVE:
-      lcd.fillCircle(cx, cy, 14, col);
-      lcd.fillCircle(cx, cy, 5, TFT_BLACK);
+      lcd.fillCircle(cx, cy, 11, col);
+      lcd.fillCircle(cx, cy, 4, TFT_BLACK);
       break;
     case NAV_TURN_STRAIGHT:
     default:
-      lcd.fillRect(cx - 5, cy - 6, 10, 26, col);
-      lcd.fillTriangle(cx, cy - 22, cx - 14, cy - 4, cx + 14, cy - 4, col);
+      lcd.fillRect(cx - 4, cy - 4, 8, 18, col);
+      lcd.fillTriangle(cx, cy - 16, cx - 11, cy - 3, cx + 11, cy - 3, col);
       break;
   }
 }
 
-void renderPageNav(bool fullClear, bool relayOn, bool emgBypass, const NavTelemetryData &nav, bool navOnline, uint8_t enterStage = 255) {
+static void renderPageNav(bool fullClear, bool relayOn, bool emgBypass, const NavTelemetryData &nav, bool navOnline, uint8_t enterStage = 255) {
+  GfxBatch batch;
   if (fullClear) {
     lcd.fillScreen(TFT_BLACK);
-    drawTopBar("2. NAVIGASI", relayOn, emgBypass);
   }
 
   if (fullClear || enterStage == 0 || enterStage == 255) {
     drawTopBar("2. NAVIGASI", relayOn, emgBypass);
 
     lcd.setTextSize(1);
-    lcd.setCursor(12, 32);
+    lcd.setCursor(70, 27);
     if (navOnline) {
       lcd.setTextColor(TFT_GREEN, TFT_BLACK);
       lcd.print("BLE CHRONOS: GMAPS AKTIF   ");
@@ -1889,107 +2604,93 @@ void renderPageNav(bool fullClear, bool relayOn, bool emgBypass, const NavTeleme
     }
 
     uint16_t turnCol = navOnline ? TFT_CYAN : TFT_DARKGREY;
-    drawNavTurnIcon(48, 76, navOnline ? nav.turn : NAV_TURN_NONE, turnCol);
+    drawNavTurnIcon(36, 54, navOnline ? nav.turn : NAV_TURN_NONE, turnCol);
 
     lcd.setTextSize(2);
     lcd.setTextColor(navOnline ? TFT_WHITE : TFT_SILVER, TFT_BLACK);
-    lcd.setCursor(92, 46);
+    lcd.setCursor(70, 38);
     lcd.printf("%-13s", navOnline ? nav.turnLabel : "NO NAV");
 
-    lcd.setTextSize(3);
+    lcd.setTextSize(2);
     lcd.setTextColor(navOnline ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(92, 72);
-    lcd.printf("%-10s", navOnline ? nav.distance : "--");
+    lcd.setCursor(70, 60);
+    lcd.printf("%-12s", navOnline ? nav.distance : "--");
   }
 
   if (fullClear || enterStage == 1 || enterStage == 255) {
     uint32_t distM = navOnline ? parseDistanceMeters(nav.distance) : 999999999UL;
     const char *cue = navOnline ? classifyProximityCue(distM, nav.turn) : "MENUNGGU RUTE";
-    uint16_t cueCol = TFT_DARKGREY;
-    if (navOnline) {
-      if (distM <= 35) cueCol = TFT_RED;
-      else if (distM <= 120) cueCol = TFT_ORANGE;
-      else if (distM <= 350) cueCol = TFT_YELLOW;
-      else cueCol = TFT_CYAN;
-    }
+    const uint16_t cueCol = !navOnline ? TFT_DARKGREY
+                          : (distM <= 35)  ? TFT_RED
+                          : (distM <= 120) ? TFT_ORANGE
+                          : (distM <= 350) ? TFT_YELLOW : TFT_CYAN;
 
-    lcd.fillRect(10, 114, 300, 34, TFT_BLACK);
+    lcd.fillRect(8, 82, 304, 28, TFT_BLACK);
     lcd.setTextSize(2);
     lcd.setTextColor(cueCol, TFT_BLACK);
-    lcd.setCursor(12, 115);
+    lcd.setCursor(10, 83);
     lcd.print(cue);
 
-    char roadClip[26];
-    if (navOnline) {
-      strncpy(roadClip, nav.roadName, 25);
-      roadClip[25] = '\0';
-    } else if (nav.bleConnected) {
-      strncpy(roadClip, "Buka rute di Google Maps", 25);
-      roadClip[25] = '\0';
-    } else {
-      strncpy(roadClip, "Hubungkan HP di Chronos", 25);
-      roadClip[25] = '\0';
-    }
+    char roadClip[32];
+    copyStr(roadClip, navOnline ? nav.roadName
+                    : nav.bleConnected ? "Buka rute di Google Maps"
+                                       : "Hubungkan HP di Chronos");
     lcd.setTextSize(1);
     lcd.setTextColor(navOnline ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(12, 136);
+    lcd.setCursor(10, 101);
     lcd.print(roadClip);
   }
 
   if (fullClear || enterStage >= 2 || enterStage == 255) {
-    lcd.drawFastHLine(0, 150, 320, TFT_DARKGREY);
-    lcd.drawFastVLine(108, 150, 56, TFT_DARKGREY);
-    lcd.drawFastVLine(216, 150, 56, TFT_DARKGREY);
+    lcd.drawFastHLine(0, 112, 320, TFT_DARKGREY);
+    lcd.drawFastVLine(108, 112, 42, TFT_DARKGREY);
+    lcd.drawFastVLine(216, 112, 42, TFT_DARKGREY);
 
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_SILVER, TFT_BLACK);
-    lcd.setCursor(8, 158);
+    lcd.setCursor(8, 116);
     lcd.print("KECEPATAN");
 
     char spdClip[9];
-    strncpy(spdClip, navOnline ? nav.speedInfo : "-- KM/J", 8);
-    spdClip[8] = '\0';
+    copyStr(spdClip, navOnline ? nav.speedInfo : "-- KM/J");
     lcd.setTextSize(2);
     lcd.setTextColor(navOnline ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(8, 176);
+    lcd.setCursor(8, 130);
     lcd.printf("%-8s", spdClip);
 
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_SILVER, TFT_BLACK);
-    lcd.setCursor(115, 158);
+    lcd.setCursor(115, 116);
     lcd.print("SISA WAKTU");
 
     char durClip[9];
-    strncpy(durClip, navOnline ? nav.durationInfo : "--", 8);
-    durClip[8] = '\0';
+    copyStr(durClip, navOnline ? nav.durationInfo : "--");
     lcd.setTextSize(2);
     lcd.setTextColor(navOnline ? TFT_CYAN : TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(115, 176);
+    lcd.setCursor(115, 130);
     lcd.printf("%-8s", durClip);
 
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_SILVER, TFT_BLACK);
-    lcd.setCursor(223, 158);
+    lcd.setCursor(223, 116);
     lcd.print("EST. TIBA");
 
     char etaClip[9];
-    strncpy(etaClip, navOnline ? nav.etaInfo : "--", 8);
-    etaClip[8] = '\0';
+    copyStr(etaClip, navOnline ? nav.etaInfo : "--");
     lcd.setTextSize(2);
     lcd.setTextColor(navOnline ? TFT_WHITE : TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(223, 176);
+    lcd.setCursor(223, 130);
     lcd.printf("%-8s", etaClip);
 
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(12, 212);
-    lcd.print("1x: Masuk TCI | Tahan 3s: Buka Jok");
-    lcd.setCursor(12, 225);
-    lcd.printf("BLE Chronos: %-20s", BLE_DEVICE_NAME);
+    lcd.setCursor(10, 158);
+    lcd.print("1x: TCI | 2x: Home | Tahan 3s: Buka Jok");
   }
 }
 
-void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass, const TelemetryData &d, bool online, uint8_t enterStage = 255) {
+static void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass, const TelemetryData &d, bool online, uint8_t enterStage = 255) {
+  GfxBatch batch;
   if (fullClear) {
     lcd.fillScreen(TFT_BLACK);
   }
@@ -1999,14 +2700,14 @@ void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass, const 
 
   if (!online) {
     if (fullClear || enterStage >= 1 || enterStage == 255) {
-      lcd.drawRoundRect(10, 34, 300, 178, 6, TFT_RED);
-      lcd.fillRect(11, 35, 298, 176, TFT_BLACK);
+      lcd.drawRoundRect(10, 28, 300, 134, 6, TFT_RED);
+      lcd.fillRect(11, 29, 298, 132, TFT_BLACK);
       lcd.setTextColor(TFT_RED, TFT_BLACK);
       lcd.setTextSize(3);
-      lcd.setCursor(65, 75);
+      lcd.setCursor(65, 58);
       lcd.print("NO SIGNAL");
       lcd.setTextSize(2);
-      lcd.setCursor(55, 125);
+      lcd.setCursor(55, 102);
       lcd.setTextColor(TFT_SILVER, TFT_BLACK);
       lcd.print("Cek C3 / ECU TCI");
     }
@@ -2022,50 +2723,50 @@ void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass, const 
   if (fullClear || enterStage == 0 || enterStage == 255) {
     lcd.setTextSize(2);
     lcd.setTextColor(modeCol, TFT_BLACK);
-    lcd.setCursor(12, 34);
+    lcd.setCursor(10, 28);
     lcd.printf("MODE:%-4s", modeStr);
 
     uint16_t voltCol = (d.battVolt10 < BATT_MIN_WARN_10 || d.battVolt10 > BATT_MAX_WARN_10) ? TFT_RED : TFT_WHITE;
     lcd.setTextColor(voltCol, TFT_BLACK);
-    lcd.setCursor(190, 34);
+    lcd.setCursor(192, 28);
     lcd.printf("%4.1fV", d.battVolt10 / 10.0f);
 
     lcd.setTextSize(3);
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.setCursor(12, 62);
+    lcd.setCursor(10, 48);
     lcd.printf("RPM:%5u", d.rpm);
 
     int barW = map(constrain(static_cast<int>(d.rpm), 0, static_cast<int>(MAX_RPM_SCALE)),
-                   0, static_cast<int>(MAX_RPM_SCALE), 0, 294);
-    lcd.drawRect(12, 96, 296, 14, TFT_DARKGREY);
+                   0, static_cast<int>(MAX_RPM_SCALE), 0, 298);
+    lcd.drawRect(10, 75, 300, 12, TFT_DARKGREY);
     uint16_t barCol = (d.rpm > RPM_WARN_RED) ? TFT_RED : ((d.rpm > RPM_WARN_YELLOW) ? TFT_YELLOW : TFT_GREEN);
     if (barW > 0) {
-      lcd.fillRect(13, 97, barW, 12, barCol);
+      lcd.fillRect(11, 76, barW, 10, barCol);
     }
-    if (barW < 294) {
-      lcd.fillRect(13 + barW, 97, 294 - barW, 12, TFT_BLACK);
+    if (barW < 298) {
+      lcd.fillRect(11 + barW, 76, 298 - barW, 10, TFT_BLACK);
     }
   }
 
   if (fullClear || enterStage == 1 || enterStage == 255) {
     lcd.setTextSize(2);
     lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-    lcd.setCursor(12, 120);
+    lcd.setCursor(10, 93);
     lcd.printf("Adv :%5.1f*", d.degree10 / 10.0f);
 
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.setCursor(175, 120);
+    lcd.setCursor(175, 93);
     lcd.printf("TPS:%3u%%", d.tps);
 
     uint16_t tempCol = (d.temp10 >= ENG_TEMP_WARN_10) ? TFT_RED : ((d.temp10 > 900) ? TFT_YELLOW : TFT_ORANGE);
     lcd.setTextColor(tempCol, TFT_BLACK);
-    lcd.setCursor(12, 148);
+    lcd.setCursor(10, 114);
     lcd.printf("Temp:%5.0fC", d.temp10 / 10.0f);
   }
 
   if (fullClear || enterStage >= 2 || enterStage == 255) {
     lcd.setTextSize(2);
-    lcd.setCursor(12, 178);
+    lcd.setCursor(10, 135);
     if (d.faultCode != FAULT_NONE || d.state == STATE_LIMP_HOME) {
       lcd.setTextColor(TFT_RED, TFT_BLACK);
       if (d.faultCode & FAULT_TPS_OUT)        lcd.print("LIMP: ERR TPS   ");
@@ -2084,12 +2785,13 @@ void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass, const 
 
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(12, 222);
-    lcd.print("1x: Kurva | 2x: Home | Tahan 3s: Mode (RPM<=400)");
+    lcd.setCursor(10, 158);
+    lcd.print("1x:Kurva | 2x:Home | Tahan 3s:Mode (RPM<=400)");
   }
 }
 
-void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, const TelemetryData &d, const uint8_t *hist, int histIdx, bool online, uint8_t enterStage = 255) {
+static void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, const TelemetryData &d, const uint8_t *hist, int histIdx, bool online, uint8_t enterStage = 255) {
+  GfxBatch batch;
   if (fullClear) {
     lcd.fillScreen(TFT_BLACK);
   }
@@ -2097,10 +2799,10 @@ void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, const Tele
     drawTopBar("3. ADV CURVE", relayOn, emgBypass);
   }
 
-  constexpr int plotX = 16;
-  constexpr int plotY = 36;
+  constexpr int plotX = 10;
+  constexpr int plotY = 28;
   constexpr int plotW = ADV_HIST_LEN;
-  constexpr int plotH = 148;
+  constexpr int plotH = 104;
   constexpr int baseY = plotY + plotH - 2;
 
   if (fullClear || enterStage == 0 || enterStage == 255) {
@@ -2110,12 +2812,12 @@ void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, const Tele
     if (!online) {
       lcd.setTextColor(TFT_RED, TFT_BLACK);
       lcd.setTextSize(2);
-      lcd.setCursor(38, 100);
+      lcd.setCursor(32, 72);
       lcd.print("NO SIGNAL");
       return;
     }
 
-    lcd.drawFastHLine(plotX + 1, plotY + plotH / 2, plotW - 2, 0x2104);
+    lcd.drawFastHLine(plotX + 1, plotY + plotH / 2, plotW - 2, COL_FRAME);
 
     int prevX = plotX + 1;
     int prevY = baseY;
@@ -2134,23 +2836,27 @@ void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, const Tele
   if (fullClear || enterStage == 1 || enterStage == 255) {
     lcd.setTextSize(2);
     lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-    lcd.setCursor(186, 44);
+    lcd.setCursor(180, 34);
     lcd.printf("ADV:%4.1f*", d.degree10 / 10.0f);
 
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.setCursor(186, 76);
+    lcd.setCursor(180, 62);
     lcd.printf("M:%u", d.mode);
+
+    lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+    lcd.setCursor(180, 90);
+    lcd.printf("TPS:%3u%%", d.tps);
   }
 
   if (fullClear || enterStage >= 2 || enterStage == 255) {
     lcd.setTextSize(2);
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-    lcd.setCursor(14, 196);
-    lcd.printf("RPM:%5u  TPS:%3u%%", d.rpm, d.tps);
+    lcd.setCursor(10, 137);
+    lcd.printf("RPM:%5u  TMP:%3.0fC", d.rpm, d.temp10 / 10.0f);
 
     lcd.setTextSize(1);
     lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    lcd.setCursor(14, 222);
+    lcd.setCursor(10, 158);
     lcd.print("1x: Dashboard | 2x: Home | Tahan 3s: Mode");
   }
 }
@@ -2158,255 +2864,255 @@ void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, const Tele
 // ============================================================================
 // FREERTOS TASKS
 // ============================================================================
-void taskImmobilizerCore1(void* pvParameters) {
+static void checkStackWatermark(const char *taskName, unsigned long nowMs, unsigned long &lastCheckMs) {
+  if ((nowMs - lastCheckMs) < STACK_CHECK_MS) return;
+  lastCheckMs = nowMs;
+  const UBaseType_t highWater = uxTaskGetStackHighWaterMark(nullptr);
+  if (highWater < STACK_WARN_WORDS) {
+    Serial.printf("[WARN] %s stack low: %u words\n", taskName, static_cast<unsigned int>(highWater));
+  }
+}
+
+struct DebouncedButton {
+  bool          lastReading  = HIGH;
+  bool          stableState  = HIGH;
+  unsigned long lastChangeMs = 0;
+
+  bool update(bool reading, unsigned long nowMs) {
+    if (reading != lastReading) lastChangeMs = nowMs;
+    lastReading = reading;
+    if ((nowMs - lastChangeMs) > DEBOUNCE_MS && reading != stableState) {
+      stableState = reading;
+      return true;
+    }
+    return false;
+  }
+  void reset() { lastReading = HIGH; stableState = HIGH; }
+};
+
+// ============================================================================
+// TASK IMMOBILIZER (CORE 1, PRIORITAS 4)
+// ============================================================================
+static void taskImmobilizerCore1(void* pvParameters) {
   (void)pvParameters;
   esp_task_wdt_add(nullptr);
 
-  bool lastReading             = HIGH;
-  bool stableState             = HIGH;
-  bool isPressed               = false;
-  bool longPressSent           = false;
-  uint8_t pendingClicks        = 0;
-  unsigned long lastDebMs      = 0;
+  DebouncedButton mainBtn;
+  bool          isPressed      = false;
+  bool          longPressSent  = false;
+  uint8_t       pendingClicks  = 0;
   unsigned long pressStartMs   = 0;
   unsigned long lastClickRelMs = 0;
+
+  DebouncedButton emBtn;
+  bool          emPressed   = false;
+  bool          emTriggered = false;
+  unsigned long emStart     = 0;
+
   unsigned long lastFingerMs   = 0;
-
-  bool emLastReading    = HIGH;
-  bool emStableState    = HIGH;
-  bool emPressed        = false;
-  bool emTriggered      = false;
-  unsigned long emDebMs = 0;
-  unsigned long emStart = 0;
-
-  bool enLastReading    = HIGH;
-  bool enStableState    = HIGH;
-  bool enPressed        = false;
-  bool enTriggered      = false;
-  unsigned long enDebMs = 0;
-  unsigned long enStart = 0;
+  unsigned long lastStackChkMs = 0;
 
   auto resetMainButtonState = [&]() {
-    lastReading   = HIGH;
-    stableState   = HIGH;
+    mainBtn.reset();
     isPressed     = false;
     longPressSent = false;
     pendingClicks = 0;
   };
 
+  auto unlockSystem = [&](const char *status, unsigned long nowMs) {
+    {
+      CritSection cs(g_stateMux);
+      copyStr(g_fingerStatus, status);
+      g_systemUnlocked = true;
+      g_bootState      = BOOT_UNLOCKED_ACTIVE;
+      g_currentPage    = PAGE_HOME;
+      g_needFullClear  = true;
+    }
+    requestStopWatchScanOnce();
+    applyRelayOutput(nowMs);
+    triggerLedAndBuzzer(1, 2000, BUZZ_UNLOCK, nowMs);
+    resetMainButtonState();
+    postCore0(CMD_PAGE_CHANGED);
+  };
+
+  auto goToPage = [&](PageId prev, PageId next, bool unlocked) {
+    setSystemStateAtomic(BOOT_UNLOCKED_ACTIVE, next, unlocked, true);
+    postCore0(CMD_PAGE_CHANGED, prev, next);
+  };
+
   for (;;) {
     esp_task_wdt_reset();
-    unsigned long nowMs = millis();
-    serviceLedAndBuzzer(g_systemUnlocked || g_emergencyByPass, nowMs);
+    const unsigned long nowMs = millis();
 
-    // --- 0. Tombol Pendaftaran Sidik Jari R503 (GPIO 38, tahan 2 detik) ---
-    bool enReading = digitalRead(PIN_BTN_ENROLL);
-    if (enReading != enLastReading) enDebMs = nowMs;
-    if ((nowMs - enDebMs) > DEBOUNCE_MS) {
-      if (enReading != enStableState) {
-        enStableState = enReading;
-        if (enStableState == LOW) {
-          enPressed   = true;
-          enTriggered = false;
-          enStart     = nowMs;
-        } else {
-          enPressed   = false;
-          enTriggered = false;
-        }
-      }
+    applyRelayOutput(nowMs);
+    checkStackWatermark("ImmobCore1", nowMs, lastStackChkMs);
+
+    bool unlockedSnap;
+    bool emgSnap;
+    {
+      CritSection cs(g_stateMux);
+      unlockedSnap = g_systemUnlocked;
+      emgSnap      = g_emergencyByPass;
     }
-    enLastReading = enReading;
+    serviceLedAndBuzzer(unlockedSnap || emgSnap, nowMs);
 
-    if (enPressed && !enTriggered && ((nowMs - enStart) >= ENROLL_HOLD_MS)) {
-      enTriggered = true;
-      if (!g_systemUnlocked) {
-        triggerLedAndBuzzer(2, 1200, BUZZ_ALERT, nowMs);
-        triggerPopup("ENROLL DITOLAK", "BUKA KUNCI DULU", TFT_RED, 1800);
-      } else {
-        uint16_t newId = 0;
-        char stBuf[32] = "ENROLL...";
-        bool ok = enrollFingerprintNextSlot(newId, stBuf, sizeof(stBuf));
-        portENTER_CRITICAL(&g_stateMux);
-        strncpy(g_fingerStatus, stBuf, sizeof(g_fingerStatus) - 1);
-        g_fingerStatus[sizeof(g_fingerStatus) - 1] = '\0';
-        g_needFullClear = true;
-        portEXIT_CRITICAL(&g_stateMux);
-        if (!ok) {
-          triggerPopup("ENROLL GAGAL", stBuf, TFT_RED, 1800);
-        }
-      }
-      resetMainButtonState();
+    serviceEnrollCommandsOnCore1(nowMs);
+
+    if (g_enrollCtx.state != ENROLL_IDLE) {
+      stepEnrollSession(nowMs);
     }
 
-    // --- 1. Tombol Emergency Bypass (GPIO 2, tahan 3.5 detik) ---
-    bool emReading = digitalRead(PIN_BTN_EMRG);
-    if (emReading != emLastReading) emDebMs = nowMs;
-    if ((nowMs - emDebMs) > DEBOUNCE_MS) {
-      if (emReading != emStableState) {
-        emStableState = emReading;
-        if (emStableState == LOW) {
-          emPressed   = true;
-          emTriggered = false;
-          emStart     = nowMs;
-        } else {
-          emPressed   = false;
-          emTriggered = false;
-        }
-      }
+    if (emBtn.update(digitalRead(PIN_BTN_EMRG), nowMs)) {
+      emPressed   = (emBtn.stableState == LOW);
+      emTriggered = false;
+      if (emPressed) emStart = nowMs;
     }
-    emLastReading = emReading;
 
     if (emPressed && !emTriggered && ((nowMs - emStart) >= EMERGENCY_HOLD_MS)) {
       emTriggered = true;
-      bool newEmg = !g_emergencyByPass;
-
-      portENTER_CRITICAL(&g_stateMux);
-      g_emergencyByPass = newEmg;
-      if (newEmg) {
-        g_bootState   = BOOT_UNLOCKED_ACTIVE;
-        g_currentPage = PAGE_HOME;
-        memcpy(g_fingerStatus, "EMERGENCY ON", sizeof(g_fingerStatus));
-      } else if (!g_systemUnlocked) {
-        g_bootState   = BOOT_WAIT_FINGERPRINT;
-        g_currentPage = PAGE_HOME;
-        g_seatRelayActive = false;
-        memcpy(g_fingerStatus, "LOCKED (R503)", sizeof(g_fingerStatus));
-      } else {
-        memcpy(g_fingerStatus, "UNLOCKED (R503)", sizeof(g_fingerStatus));
+      if (g_enrollCtx.state != ENROLL_IDLE) {
+        abortEnrollSession("DIBATALKAN (EMG)", nowMs);
       }
-      g_needFullClear = true;
-      portEXIT_CRITICAL(&g_stateMux);
+
+      bool newEmg;
+      bool stillUnlocked;
+      {
+        CritSection cs(g_stateMux);
+        g_emergencyByPass = !g_emergencyByPass;
+        newEmg            = g_emergencyByPass;
+        stillUnlocked     = g_systemUnlocked;
+        if (newEmg) {
+          g_bootState   = BOOT_UNLOCKED_ACTIVE;
+          g_currentPage = PAGE_HOME;
+          copyStr(g_fingerStatus, "EMERGENCY ON");
+        } else if (!stillUnlocked) {
+          g_bootState       = BOOT_WAIT_FINGERPRINT;
+          g_currentPage     = PAGE_HOME;
+          g_seatRelayActive = false;
+          copyStr(g_fingerStatus, "LOCKED (R503)");
+        } else {
+          copyStr(g_fingerStatus, "UNLOCKED (R503)");
+        }
+        g_needFullClear = true;
+      }
 
       applyRelayOutput(nowMs);
       resetMainButtonState();
 
       if (newEmg) {
+        requestStopWatchScanOnce();
         triggerLedAndBuzzer(2, 2000, BUZZ_ALERT, nowMs);
         triggerPopup("EMERGENCY ON", "RELAY BYPASS", TFT_ORANGE, 1800);
-      } else if (!g_systemUnlocked) {
+      } else if (!stillUnlocked) {
         triggerLedAndBuzzer(0, 0, BUZZ_ENROLL_STEP, nowMs);
-        setTciGateForPage(false);
-        Core0Command cmd = {CMD_SYSTEM_LOCKED, PAGE_HOME, PAGE_HOME, false};
-        if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
+        postCore0(CMD_SYSTEM_LOCKED);
       }
-
-      if (g_core0CmdQueue) {
-        Core0Command emgCmd = {CMD_SAVE_EMG_STATE, PAGE_HOME, PAGE_HOME, newEmg};
-        xQueueSend(g_core0CmdQueue, &emgCmd, 0);
-      }
+      postCore0(CMD_SAVE_EMG_STATE, PAGE_HOME, PAGE_HOME, newEmg);
     }
 
-    // --- 2. Autentikasi Sidik Jari R503 ---
-    unsigned long cooldownUntil = g_fingerCooldownUntilMs.load(std::memory_order_acquire);
-    if (!g_systemUnlocked && (nowMs >= cooldownUntil) && (nowMs - lastFingerMs >= 140)) {
+    if (!isSystemUnlockedAtomic() &&
+        g_watchOneShotMatched.exchange(false, std::memory_order_acq_rel)) {
+      char stBuf[32];
+      snprintf(stBuf, sizeof(stBuf), "GW4 (%ddBm)", g_watchMatchedRssi.load(std::memory_order_acquire));
+      unlockSystem(stBuf, nowMs);
+      triggerPopup("WATCH UNLOCK", "RELAY ON", TFT_GREEN, 1800);
+    }
+
+    bool inCooldown = g_fingerCooldownActive.load(std::memory_order_acquire);
+    if (inCooldown &&
+        (nowMs - g_fingerCooldownStartMs.load(std::memory_order_acquire)) >= FINGER_FAIL_COOLDOWN_MS) {
+      g_fingerCooldownActive.store(false, std::memory_order_release);
+      inCooldown = false;
+    }
+
+    if (!isSystemUnlockedAtomic() && (g_enrollCtx.state == ENROLL_IDLE) && !inCooldown &&
+        ((nowMs - lastFingerMs) >= FINGER_POLL_MS)) {
       lastFingerMs = nowMs;
-      uint16_t fid = 0;
-      int conf = 0;
-      int scanRes = scanFingerprintOnce(fid, conf);
+      uint16_t fid  = 0;
+      int      conf = 0;
+      const int scanRes = scanFingerprintOnce(fid, conf);
       if (scanRes == 0) {
         g_fingerFailStreak.store(0, std::memory_order_release);
         char stBuf[32];
         snprintf(stBuf, sizeof(stBuf), "ID#%u (%d)", fid, conf);
-
-        portENTER_CRITICAL(&g_stateMux);
-        memcpy(g_fingerStatus, stBuf, sizeof(g_fingerStatus));
-        g_systemUnlocked = true;
-        g_bootState      = BOOT_UNLOCKED_ACTIVE;
-        g_currentPage    = PAGE_HOME;
-        g_needFullClear  = true;
-        portEXIT_CRITICAL(&g_stateMux);
-
-        applyRelayOutput(nowMs);
-        triggerLedAndBuzzer(1, 2000, BUZZ_UNLOCK, nowMs);
-        setTciGateForPage(false);
-        resetMainButtonState();
-
-        Core0Command cmd = {CMD_PAGE_CHANGED, PAGE_HOME, PAGE_HOME, false};
-        if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
-      } else if (scanRes == -2 || scanRes == -3) {
-        uint8_t fails = static_cast<uint8_t>(g_fingerFailStreak.fetch_add(1, std::memory_order_acq_rel) + 1);
+        unlockSystem(stBuf, nowMs);
+      } else if (scanRes == -2) {
+        const uint8_t fails = static_cast<uint8_t>(g_fingerFailStreak.fetch_add(1, std::memory_order_acq_rel) + 1);
         if (fails >= FINGER_MAX_FAIL_STREAK) {
           g_fingerFailStreak.store(0, std::memory_order_release);
-          g_fingerCooldownUntilMs.store(nowMs + FINGER_FAIL_COOLDOWN_MS, std::memory_order_release);
+          g_fingerCooldownStartMs.store(nowMs, std::memory_order_release);
+          g_fingerCooldownActive.store(true, std::memory_order_release);
           triggerLedAndBuzzer(2, 2000, BUZZ_ALERT, nowMs);
           triggerPopup("JARI DITOLAK", "TUNGGU 5 DETIK", TFT_RED, 2200);
         }
       }
     }
 
-    // --- 3. Tombol Utama (GPIO 1) ---
-    bool canOperateUi = (g_systemUnlocked || g_emergencyByPass);
-    if (canOperateUi) {
-      bool reading = digitalRead(PIN_BTN_MAIN);
-      if (reading != lastReading) lastDebMs = nowMs;
-
-      if ((nowMs - lastDebMs) > DEBOUNCE_MS) {
-        if (reading != stableState) {
-          stableState = reading;
-          if (stableState == LOW) {
-            isPressed     = true;
-            longPressSent = false;
-            pressStartMs  = nowMs;
-          } else {
-            if (isPressed && !longPressSent) {
-              pendingClicks++;
-              lastClickRelMs = nowMs;
-            }
-            if (g_seatRelayActive) {
-              setSeatRelayHold(false, nowMs);
-            }
-            isPressed     = false;
-            longPressSent = false;
+    if (isRelayAuthorizedAtomic()) {
+      if (mainBtn.update(digitalRead(PIN_BTN_MAIN), nowMs)) {
+        if (mainBtn.stableState == LOW) {
+          isPressed     = true;
+          longPressSent = false;
+          pressStartMs  = nowMs;
+        } else {
+          if (isPressed && !longPressSent) {
+            pendingClicks++;
+            lastClickRelMs = nowMs;
           }
+          if (isSeatRelayActiveAtomic()) {
+            setSeatRelayHold(false, nowMs);
+          }
+          isPressed     = false;
+          longPressSent = false;
         }
       }
-      lastReading = reading;
 
       if (isPressed && !longPressSent && ((nowMs - pressStartMs) >= LONG_PRESS_MS)) {
         longPressSent = true;
         pendingClicks = 0;
-
-        if (g_currentPage == PAGE_TCI) {
-          Core0Command cmd = {CMD_TCI_NEXT_MODE, PAGE_TCI, PAGE_TCI, false};
-          if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
+        if (getCurrentPageAtomic() == PAGE_TCI) {
+          postCore0(CMD_TCI_NEXT_MODE, PAGE_TCI, PAGE_TCI);
         } else {
           setSeatRelayHold(true, nowMs);
         }
       }
 
       if (pendingClicks > 0 && !isPressed && ((nowMs - lastClickRelMs) >= DOUBLE_TAP_MS)) {
-        uint8_t clicks = pendingClicks;
+        const uint8_t clicks = pendingClicks;
         pendingClicks = 0;
 
-        PageId prevPage = g_currentPage;
+        const PageId prevPage = getCurrentPageAtomic();
+        const bool   curUnl   = isSystemUnlockedAtomic();
+
         if (clicks >= 2) {
-          if (g_currentPage == PAGE_TCI) {
-            setSystemStateAtomic(BOOT_UNLOCKED_ACTIVE, PAGE_HOME, g_systemUnlocked, true);
-            setTciGateForPage(false);
-            Core0Command cmd = {CMD_PAGE_CHANGED, prevPage, PAGE_HOME, false};
-            if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
+          if (prevPage == PAGE_TCI) {
+            goToPage(prevPage, PAGE_HOME, curUnl);
+          } else if (prevPage == PAGE_HOME && curUnl) {
+            if (g_enrollCtx.state != ENROLL_IDLE) {
+              abortEnrollSession("DIBATALKAN (LOCK)", nowMs);
+            }
+            {
+              CritSection cs(g_stateMux);
+              g_systemUnlocked  = false;
+              g_emergencyByPass = false;
+              g_bootState       = BOOT_WAIT_FINGERPRINT;
+              g_currentPage     = PAGE_HOME;
+              g_seatRelayActive = false;
+              copyStr(g_fingerStatus, "LOCKED (MANUAL)");
+              g_needFullClear   = true;
+            }
+            applyRelayOutput(nowMs);
+            triggerLedAndBuzzer(0, 0, BUZZ_ENROLL_STEP, nowMs);
+            postCore0(CMD_SYSTEM_LOCKED, prevPage, PAGE_HOME);
           } else {
-            PageId nextP = (g_currentPage == PAGE_HOME) ? PAGE_NAV : PAGE_HOME;
-            setSystemStateAtomic(BOOT_UNLOCKED_ACTIVE, nextP, g_systemUnlocked, true);
-            setTciGateForPage(false);
-            Core0Command cmd = {CMD_PAGE_CHANGED, prevPage, nextP, false};
-            if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
+            goToPage(prevPage, (prevPage == PAGE_HOME) ? PAGE_NAV : PAGE_HOME, curUnl);
           }
-        } else {
-          if (g_currentPage == PAGE_HOME) {
-            setSystemStateAtomic(BOOT_UNLOCKED_ACTIVE, PAGE_NAV, g_systemUnlocked, true);
-            setTciGateForPage(false);
-            Core0Command cmd = {CMD_PAGE_CHANGED, prevPage, PAGE_NAV, false};
-            if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
-          } else if (g_currentPage == PAGE_NAV) {
-            setSystemStateAtomic(BOOT_UNLOCKED_ACTIVE, PAGE_TCI, g_systemUnlocked, true);
-            setTciGateForPage(true);
-            Core0Command cmd = {CMD_PAGE_CHANGED, prevPage, PAGE_TCI, false};
-            if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
-          } else if (g_currentPage == PAGE_TCI) {
-            Core0Command cmd = {CMD_SUBPAGE_TOGGLE, PAGE_TCI, PAGE_TCI, false};
-            if (g_core0CmdQueue) xQueueSend(g_core0CmdQueue, &cmd, 0);
-          }
+        } else if (prevPage == PAGE_HOME) {
+          goToPage(prevPage, PAGE_NAV, curUnl);
+        } else if (prevPage == PAGE_NAV) {
+          goToPage(prevPage, PAGE_TCI, curUnl);
+        } else if (prevPage == PAGE_TCI) {
+          postCore0(CMD_SUBPAGE_TOGGLE, PAGE_TCI, PAGE_TCI);
         }
       }
     }
@@ -2416,166 +3122,263 @@ void taskImmobilizerCore1(void* pvParameters) {
   }
 }
 
-void taskDisplayLcdCore0(void* pvParameters) {
-  (void)pvParameters;
-  esp_task_wdt_add(nullptr);
+// ============================================================================
+// TASK KOMUNIKASI PROTOKOL & WEB ENROLL (CORE 0, PRIORITAS 3)
+// ============================================================================
+static const char *const MODE_NAMES[4] = {"DAILY", "RACING", "EXTREME", "CUSTOM"};
 
-  unsigned long lastRtcReadMs  = 0;
-  unsigned long lastNavPollMs  = 0;
-  unsigned long lastNotifPollMs = 0;
+static void triggerModePopup(const char *title, uint8_t mode, uint16_t color, uint16_t durationMs) {
+  char line2[20];
+  snprintf(line2, sizeof(line2), "%s (%u RPM)", MODE_NAMES[mode], static_cast<unsigned int>(getRedlineRPM(mode)));
+  triggerPopup(title, line2, color, durationMs);
+}
 
-  BootState lastRenderedBoot   = static_cast<BootState>(255);
-  PageId    lastRenderedPage   = static_cast<PageId>(255);
-  uint8_t   lastRenderedSub    = 255;
-  bool      lastRenderedRelay  = false;
-  bool      lastRenderedEmg    = false;
-  bool      lastRenderedOnline = false;
-  bool      lastRenderedR503   = false;
-  uint8_t   lastRenderedR503Err = 255;
-  bool      lastRenderedRtc    = false;
-  bool      lastRenderedRtcLp  = false;
-  bool      lastPopupActive    = false;
-  bool      lastNotifActive    = false;
-  uint32_t  lastPopupSeq       = 0;
-  uint32_t  lastNotifSeq       = 0;
-  uint32_t  lastRtcSeq         = 0;
-  uint32_t  lastTciSeq         = 0;
-  uint32_t  lastNavSeq         = 0;
+static bool snapshotTciPacket(TelemetryData &snap, unsigned long nowMs, uint32_t *outSeq = nullptr) {
+  unsigned long lastRx;
+  uint32_t seq;
+  {
+    CritSection cs(g_tciMux);
+    snap   = g_tciPkt;
+    lastRx = g_lastTciRxMs;
+    seq    = g_tciRxSeq;
+  }
+  if (outSeq) *outSeq = seq;
+  return isTciOnline(lastRx, nowMs);
+}
 
-  for (;;) {
-    esp_task_wdt_reset();
-    unsigned long nowMs = millis();
+static void handleCore0Command(const Core0Command &cmd, unsigned long nowMs) {
+  switch (cmd.type) {
+    case CMD_SAVE_EMG_STATE:
+      saveEmergencyStateToNvs(cmd.flagVal);
+      break;
 
-    watch.loop();
-    processIncomingEspNowFrames();
-    syncPendingEspNowPeer();
+    case CMD_RESET_C3_MAC:
+      clearC3MacFromNvs();
+      {
+        CritSection cs(g_stateMux);
+        memcpy(activeC3PeerMac, DEFAULT_C3_MAC, 6);
+        g_c3MacLocked = false;
+      }
+      triggerPopup("MAC C3 RESET", "SIAP PAIRING BARU", TFT_CYAN, 1800);
+      break;
 
-    if (nowMs - lastNavPollMs >= NAV_POLL_MS) {
-      lastNavPollMs = nowMs;
-      updateNavFromChronos();
-    }
+    case CMD_PAGE_CHANGED:
+      if (cmd.nextPage == PAGE_TCI) {
+        initTciEspNowOnce();
+        setTciSubPageAtomic(0, false);
+      }
+      {
+        CritSection cs(g_stateMux);
+        g_needFullClear = true;
+      }
+      break;
 
-    if (nowMs - lastNotifPollMs >= NOTIF_POLL_MS) {
-      lastNotifPollMs = nowMs;
-      pollChronosNotification();
-    }
+    case CMD_SUBPAGE_TOGGLE:
+      setTciSubPageAtomic(static_cast<uint8_t>((getTciSubPageAtomic() + 1) % 2), true);
+      break;
 
-    Core0Command cmd;
-    while (g_core0CmdQueue && xQueueReceive(g_core0CmdQueue, &cmd, 0) == pdTRUE) {
-      if (cmd.type == CMD_SAVE_EMG_STATE) {
-        saveEmergencyStateToNvs(cmd.flagVal);
-      } else if (cmd.type == CMD_PAGE_CHANGED) {
-        if (cmd.nextPage == PAGE_TCI) {
-          initTciEspNowOnce();
-          setTciSubPageAtomic(0, false);
-        }
-        startComponentTransition(8);
-        lastRenderedPage = static_cast<PageId>(255);
-      } else if (cmd.type == CMD_SUBPAGE_TOGGLE) {
-        uint8_t nextSub = static_cast<uint8_t>((getTciSubPageAtomic() + 1) % 2);
-        setTciSubPageAtomic(nextSub, false);
-        startComponentTransition(8);
-        lastRenderedSub = 255;
-      } else if (cmd.type == CMD_TCI_NEXT_MODE) {
-        TelemetryData snap;
-        unsigned long lastRx = 0;
-        portENTER_CRITICAL(&g_tciMux);
-        snap   = g_tciPkt;
-        lastRx = g_lastTciRxMs;
-        portEXIT_CRITICAL(&g_tciMux);
-
-        bool online = (lastRx > 0) && ((nowMs - lastRx) < TCI_TIMEOUT_MS);
-        if (!online) {
-          triggerPopup("NO SIGNAL", "C3 / TCI OFFLINE", TFT_RED, 1500);
-        } else if (snap.rpm > IDLE_MAX_RPM_MODE) {
-          char rpmLine[20];
-          snprintf(rpmLine, sizeof(rpmLine), "RPM: %u (>400)", snap.rpm);
-          triggerPopup("DITOLAK!", rpmLine, TFT_RED, 1600);
-        } else {
-          uint8_t nextM = static_cast<uint8_t>((snap.mode + 1) % 4);
-          portENTER_CRITICAL(&g_stateMux);
+    case CMD_TCI_NEXT_MODE: {
+      TelemetryData snap;
+      uint32_t rxSeq = 0;
+      if (!snapshotTciPacket(snap, nowMs, &rxSeq)) {
+        triggerPopup("NO SIGNAL", "C3 / TCI OFFLINE", TFT_RED, 1500);
+      } else if (snap.rpm > IDLE_MAX_RPM_MODE) {
+        char rpmLine[20];
+        snprintf(rpmLine, sizeof(rpmLine), "RPM: %u (>400)", snap.rpm);
+        triggerPopup("DITOLAK!", rpmLine, TFT_RED, 1600);
+      } else {
+        const uint8_t nextM = static_cast<uint8_t>((snap.mode + 1) % 4);
+        {
+          CritSection cs(g_stateMux);
           g_desiredMode       = nextM;
           g_pendingModeChange = true;
           g_modeRetryCount    = 0;
           g_lastModeSendMs    = 0;
-          portEXIT_CRITICAL(&g_stateMux);
-
-          const char* mNames[4] = {"DAILY", "RACING", "EXTREME", "CUSTOM"};
-          char l2[20];
-          snprintf(l2, sizeof(l2), "%s (%u RPM)", mNames[nextM], getRedlineRPM(nextM));
-          triggerPopup("GANTI MODE...", l2, TFT_YELLOW, 1500);
+          g_modeReqStartSeq   = rxSeq;
         }
-      } else if (cmd.type == CMD_SYSTEM_LOCKED) {
-        setTciSubPageAtomic(0, false);
-        startComponentTransition(8);
-        lastRenderedBoot = static_cast<BootState>(255);
+        triggerModePopup("GANTI MODE...", nextM, TFT_YELLOW, 1500);
+      }
+      break;
+    }
+
+    case CMD_SYSTEM_LOCKED:
+      setTciSubPageAtomic(0, true);
+      break;
+  }
+}
+
+static void servicePendingModeChange(unsigned long nowMs) {
+  bool          pending;
+  uint8_t       desiredMode;
+  unsigned long lastSendMs;
+  uint8_t       retry;
+  uint32_t      reqStartSeq;
+  bool          sendCbSeen;
+  bool          lastSendOk;
+  {
+    CritSection cs(g_stateMux);
+    pending     = g_pendingModeChange;
+    desiredMode = g_desiredMode;
+    lastSendMs  = g_lastModeSendMs;
+    retry       = g_modeRetryCount;
+    reqStartSeq = g_modeReqStartSeq;
+    sendCbSeen  = g_espSendCbSeen;
+    lastSendOk  = g_lastEspSendOk;
+  }
+  if (!(isUnlockedAndOnTciPage() && pending)) return;
+
+  auto clearPending = [&]() {
+    CritSection cs(g_stateMux);
+    g_pendingModeChange = false;
+  };
+
+  auto retryOrGiveUp = [&](bool clearSendCbFlag, const char *failL1, const char *failL2) {
+    bool canRetry;
+    {
+      CritSection cs(g_stateMux);
+      if (clearSendCbFlag) g_espSendCbSeen = false;
+      canRetry = (retry < MODE_SEND_MAX_RETRY);
+      if (canRetry) g_modeRetryCount = static_cast<uint8_t>(retry + 1);
+      else          g_pendingModeChange = false;
+    }
+    if (canRetry) sendModePacket(desiredMode);
+    else          triggerPopup(failL1, failL2, TFT_RED, 1600);
+  };
+
+  TelemetryData snap;
+  uint32_t curSeq = 0;
+  const bool online = snapshotTciPacket(snap, nowMs, &curSeq);
+  if (!online || snap.rpm > IDLE_MAX_RPM_MODE) {
+    clearPending();
+  } else if (curSeq != reqStartSeq && snap.mode == desiredMode && (snap.ackStatus == 1 || snap.ackStatus == 3)) {
+    clearPending();
+    triggerModePopup("MODE AKTIF:", desiredMode, TFT_GREEN, 1600);
+  } else if (sendCbSeen && !lastSendOk) {
+    retryOrGiveUp(true, "GAGAL KIRIM", "C3 TIDAK MERESPON");
+  } else if ((nowMs - lastSendMs) >= MODE_RETRY_INT_MS) {
+    retryOrGiveUp(false, "GAGAL MODE", "TIMEOUT ACK ECU");
+  }
+}
+
+static void taskCommCore0(void* pvParameters) {
+  (void)pvParameters;
+  esp_task_wdt_add(nullptr);
+
+  unsigned long lastNavPollMs   = 0;
+  unsigned long lastNotifPollMs = 0;
+  unsigned long lastDiagLogMs   = 0;
+  unsigned long lastStackChkMs  = 0;
+
+  for (;;) {
+    esp_task_wdt_reset();
+    const unsigned long nowMs = millis();
+
+    checkStackWatermark("CommCore0", nowMs, lastStackChkMs);
+
+    serviceBootEnrollWebServer(nowMs);
+    pollWatchOneShotScan(nowMs);
+
+    const PageId activePage = getCurrentPageAtomic();
+    syncTelemetryGate(activePage);
+
+    if (isRelayAuthorizedAtomic() && !g_tciEspNowReady.load(std::memory_order_acquire)) {
+      initTciEspNowOnce();
+    }
+
+    processIncomingEspNowFrames();
+    syncPendingEspNowPeer();
+
+    watch.loop();
+    syncRtcFromChronos();
+
+    if (activePage != PAGE_TCI) {
+      if ((nowMs - lastNavPollMs) >= NAV_POLL_MS) {
+        lastNavPollMs = nowMs;
+        updateNavFromChronos();
+      }
+      if ((nowMs - lastNotifPollMs) >= NOTIF_POLL_MS) {
+        lastNotifPollMs = nowMs;
+        pollChronosNotification();
       }
     }
 
-    bool pendingModeSnap = false;
-    uint8_t desiredModeSnap = 0;
-    unsigned long lastSendSnap = 0;
-    uint8_t retrySnap = 0;
-    bool sendCbSeenSnap = false;
-    bool lastSendOkSnap = false;
-
-    portENTER_CRITICAL(&g_stateMux);
-    pendingModeSnap = g_pendingModeChange;
-    desiredModeSnap = g_desiredMode;
-    lastSendSnap    = g_lastModeSendMs;
-    retrySnap       = g_modeRetryCount;
-    sendCbSeenSnap  = g_espSendCbSeen;
-    lastSendOkSnap  = g_lastEspSendOk;
-    portEXIT_CRITICAL(&g_stateMux);
-
-    if (isUnlockedAndOnTciPage() && pendingModeSnap) {
-      TelemetryData snap;
-      unsigned long lastRx = 0;
-      portENTER_CRITICAL(&g_tciMux);
-      snap   = g_tciPkt;
-      lastRx = g_lastTciRxMs;
-      portEXIT_CRITICAL(&g_tciMux);
-
-      bool online = (lastRx > 0) && ((nowMs - lastRx) < TCI_TIMEOUT_MS);
-      if (!online || snap.rpm > IDLE_MAX_RPM_MODE) {
-        portENTER_CRITICAL(&g_stateMux);
-        g_pendingModeChange = false;
-        portEXIT_CRITICAL(&g_stateMux);
-      } else if (snap.mode == desiredModeSnap && (snap.ackStatus == 1 || snap.ackStatus == 3)) {
-        portENTER_CRITICAL(&g_stateMux);
-        g_pendingModeChange = false;
-        portEXIT_CRITICAL(&g_stateMux);
-        const char* mNames[4] = {"DAILY", "RACING", "EXTREME", "CUSTOM"};
-        char l2[20];
-        snprintf(l2, sizeof(l2), "%s (%u RPM)", mNames[desiredModeSnap], getRedlineRPM(desiredModeSnap));
-        triggerPopup("MODE AKTIF:", l2, TFT_GREEN, 1600);
-      } else if (sendCbSeenSnap && !lastSendOkSnap) {
-        portENTER_CRITICAL(&g_stateMux);
-        g_espSendCbSeen = false;
-        if (retrySnap < MODE_SEND_MAX_RETRY) {
-          g_modeRetryCount = static_cast<uint8_t>(retrySnap + 1);
-          portEXIT_CRITICAL(&g_stateMux);
-          sendModePacket(desiredModeSnap);
-        } else {
-          g_pendingModeChange = false;
-          portEXIT_CRITICAL(&g_stateMux);
-          triggerPopup("GAGAL KIRIM", "C3 TIDAK MERESPON", TFT_RED, 1600);
-        }
-      } else if ((nowMs - lastSendSnap) >= 450) {
-        portENTER_CRITICAL(&g_stateMux);
-        if (retrySnap < MODE_SEND_MAX_RETRY) {
-          g_modeRetryCount = static_cast<uint8_t>(retrySnap + 1);
-          portEXIT_CRITICAL(&g_stateMux);
-          sendModePacket(desiredModeSnap);
-        } else {
-          g_pendingModeChange = false;
-          portEXIT_CRITICAL(&g_stateMux);
-          triggerPopup("GAGAL MODE", "TIMEOUT ACK ECU", TFT_RED, 1600);
-        }
+    if ((nowMs - lastDiagLogMs) >= DIAG_LOG_MS) {
+      lastDiagLogMs = nowMs;
+      const uint32_t crcE = g_diagCrcErr.load(std::memory_order_relaxed);
+      const uint32_t macD = g_diagMacDrop.load(std::memory_order_relaxed);
+      const uint32_t txF  = g_diagTxFail.load(std::memory_order_relaxed);
+      if (crcE > 0 || macD > 0 || txF > 0) {
+        Serial.printf("[DIAG] CRC_ERR=%lu MAC_DROP=%lu TX_FAIL=%lu\n",
+                      static_cast<unsigned long>(crcE),
+                      static_cast<unsigned long>(macD),
+                      static_cast<unsigned long>(txF));
       }
     }
 
-    if (nowMs - lastRtcReadMs >= 500) {
+    Core0Command cmd;
+    while (g_core0CmdQueue && xQueueReceive(g_core0CmdQueue, &cmd, 0) == pdTRUE) {
+      handleCore0Command(cmd, nowMs);
+    }
+
+    servicePendingModeChange(nowMs);
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ============================================================================
+// TASK RENDERING LCD & RTC (CORE 0, PRIORITAS 2)
+// ============================================================================
+static constexpr unsigned long UI_FRAME_MS      = 16;
+static constexpr unsigned long UI_TRANS_TICK_MS = 8;
+
+static NavTelemetryData snapshotNav(unsigned long nowMs, bool &navOnline) {
+  NavTelemetryData snap;
+  {
+    CritSection cs(g_navMux);
+    snap = g_navData;
+  }
+  navOnline = snap.bleConnected && snap.navActive && (snap.lastRxMs > 0) &&
+              ((nowMs - snap.lastRxMs) < NAV_TIMEOUT_MS);
+  return snap;
+}
+
+static void taskDisplayLcdCore0(void* pvParameters) {
+  (void)pvParameters;
+  esp_task_wdt_add(nullptr);
+
+  unsigned long lastRtcReadMs    = 0;
+  unsigned long lastCurveDrawMs  = 0;
+  unsigned long lastTickerStepMs = 0;
+  unsigned long lastStackChkMs   = 0;
+  int           homeTickerOffset = 0;
+
+  BootState lastRenderedBoot    = static_cast<BootState>(255);
+  PageId    lastRenderedPage    = static_cast<PageId>(255);
+  uint8_t   lastRenderedSub     = 255;
+  bool      lastRenderedRelay   = false;
+  bool      lastRenderedEmg     = false;
+  bool      lastRenderedOnline  = false;
+  bool      lastRenderedR503    = false;
+  uint8_t   lastRenderedR503Err = 255;
+  bool      lastRenderedRtc     = false;
+  bool      lastRenderedRtcLp   = false;
+  bool      lastPopupActive     = false;
+  bool      lastNotifActive     = false;
+  bool      forceFullRedrawNext = false;
+  uint32_t  lastPopupSeq        = 0;
+  uint32_t  lastNotifSeq        = 0;
+  uint32_t  lastRtcSeq          = 0;
+  uint32_t  lastTciSeq          = 0;
+  uint32_t  lastNavSeq          = 0;
+
+  for (;;) {
+    esp_task_wdt_reset();
+    const unsigned long nowMs = millis();
+
+    checkStackWatermark("LcdUiCore0", nowMs, lastStackChkMs);
+
+    if ((nowMs - lastRtcReadMs) >= RTC_READ_MS) {
       lastRtcReadMs = nowMs;
       updateRtcCache();
       updateAdaptiveBacklight();
@@ -2583,83 +3386,126 @@ void taskDisplayLcdCore0(void* pvParameters) {
 
     BootState curBoot;
     PageId    curPage;
+    uint8_t   curSub;
     bool      curUnlocked;
     bool      curEmg;
     bool      fullClear;
     char      tBuf[12], dBuf[16], fBuf[32];
     float     chipTempC;
     uint32_t  rtcSeq;
-
     unsigned long popStart, popDur;
     uint32_t      popSeq;
     char          popL1[20], popL2[20];
     uint16_t      popCol;
+    {
+      CritSection cs(g_stateMux);
+      curBoot     = g_bootState;
+      curPage     = g_currentPage;
+      curSub      = g_tciSubPage;
+      curUnlocked = g_systemUnlocked;
+      curEmg      = g_emergencyByPass;
+      fullClear   = g_needFullClear || forceFullRedrawNext;
+      g_needFullClear     = false;
+      forceFullRedrawNext = false;
 
-    portENTER_CRITICAL(&g_stateMux);
-    curBoot     = g_bootState;
-    curPage     = g_currentPage;
-    curUnlocked = g_systemUnlocked;
-    curEmg      = g_emergencyByPass;
-    fullClear   = g_needFullClear;
-    if (!g_uiTrans.active) {
-      g_needFullClear = false;
+      memcpy(tBuf, g_timeStr, sizeof(tBuf));
+      memcpy(dBuf, g_dateStr, sizeof(dBuf));
+      memcpy(fBuf, g_fingerStatus, sizeof(fBuf));
+      chipTempC = g_chipTempC;
+      rtcSeq    = g_rtcSeq;
+
+      popStart = g_popupStartMs;
+      popDur   = g_popupDurationMs;
+      popSeq   = g_popupSeq;
+      memcpy(popL1, g_popupLine1, sizeof(popL1));
+      memcpy(popL2, g_popupLine2, sizeof(popL2));
+      popCol   = g_popupBgColor;
     }
-    memcpy(tBuf, g_timeStr, sizeof(tBuf));
-    memcpy(dBuf, g_dateStr, sizeof(dBuf));
-    memcpy(fBuf, g_fingerStatus, sizeof(fBuf));
-    chipTempC   = g_chipTempC;
-    rtcSeq      = g_rtcSeq;
 
-    popStart    = g_popupStartMs;
-    popDur      = g_popupDurationMs;
-    popSeq      = g_popupSeq;
-    memcpy(popL1, g_popupLine1, sizeof(popL1));
-    memcpy(popL2, g_popupLine2, sizeof(popL2));
-    popCol      = g_popupBgColor;
-    portEXIT_CRITICAL(&g_stateMux);
+    TelemetryData tciSnap;
+    unsigned long tciLastRx;
+    uint32_t      tciSeq;
+    uint8_t       tciHistCopy[ADV_HIST_LEN];
+    int           tciHistIdx;
+    {
+      CritSection cs(g_tciMux);
+      tciSnap    = g_tciPkt;
+      tciLastRx  = g_lastTciRxMs;
+      tciSeq     = g_tciRxSeq;
+      memcpy(tciHistCopy, g_advHistory, ADV_HIST_LEN);
+      tciHistIdx = g_advHistIdx;
+    }
+    const bool tciOnline = isTciOnline(tciLastRx, nowMs);
 
-    bool relayOn     = (curUnlocked || curEmg);
-    bool popupActive = isTimerActive(popStart, popDur, nowMs);
+    if (lastRenderedBoot != static_cast<BootState>(255)) {
+      if (g_uiTrans.active) {
+        if (curBoot != g_uiTrans.targetBoot || curPage != g_uiTrans.targetPage || curSub != g_uiTrans.targetSub) {
+          startComponentTransition(curBoot, curPage, curSub, 8);
+        }
+      } else if (curBoot != lastRenderedBoot || curPage != lastRenderedPage || curSub != lastRenderedSub) {
+        startComponentTransition(curBoot, curPage, curSub, 8);
+      }
+    }
+
+    const bool relayOn     = (curUnlocked || curEmg);
+    const bool popupActive = isTimerActive(popStart, popDur, nowMs);
 
     NotifPopupData notifSnap;
-    portENTER_CRITICAL(&g_notifMux);
-    if (g_notifPopup.active && !isTimerActive(g_notifPopup.startMs, g_notifPopup.durationMs, nowMs)) {
-      g_notifPopup.active = false;
+    {
+      CritSection cs(g_notifMux);
+      if (g_notifPopup.active && !isTimerActive(g_notifPopup.startMs, g_notifPopup.durationMs, nowMs)) {
+        g_notifPopup.active = false;
+      }
+      notifSnap = g_notifPopup;
     }
-    notifSnap = g_notifPopup;
-    portEXIT_CRITICAL(&g_notifMux);
-
-    bool notifActive = notifSnap.active && (curBoot == BOOT_UNLOCKED_ACTIVE) && (curPage != PAGE_TCI);
+    const bool notifActive = notifSnap.active && (curBoot == BOOT_UNLOCKED_ACTIVE) && (curPage != PAGE_TCI);
 
     if (popupActive) {
+      resetUiTransition();
       if (!lastPopupActive || popSeq != lastPopupSeq) {
         drawTciPopup(popL1, popL2, popCol);
         lastPopupSeq = popSeq;
       }
       lastPopupActive = true;
-      vTaskDelay(pdMS_TO_TICKS(16));
+      vTaskDelay(pdMS_TO_TICKS(UI_FRAME_MS));
       continue;
     } else if (lastPopupActive) {
-      lastPopupActive = false;
-      fullClear       = true;
+      lastPopupActive     = false;
+      fullClear           = true;
+      forceFullRedrawNext = true;
     }
 
     if (notifActive) {
+      resetUiTransition();
       if (!lastNotifActive || notifSnap.seq != lastNotifSeq) {
         drawNotifPopup(notifSnap);
         lastNotifSeq = notifSnap.seq;
       }
       lastNotifActive = true;
-      vTaskDelay(pdMS_TO_TICKS(16));
+      vTaskDelay(pdMS_TO_TICKS(UI_FRAME_MS));
       continue;
     } else if (lastNotifActive) {
-      lastNotifActive = false;
-      fullClear       = true;
+      lastNotifActive     = false;
+      fullClear           = true;
+      forceFullRedrawNext = true;
     }
+
+    const bool    rtcOk    = g_rtcOk.load(std::memory_order_acquire);
+    const bool    rtcLp    = g_rtcLostPower.load(std::memory_order_acquire);
+    const bool    r503Ok   = g_r503Ok.load(std::memory_order_acquire);
+    const uint8_t r503Err  = g_lastR503Err.load(std::memory_order_acquire);
+
+    auto commitCommon = [&](bool online) {
+      lastRenderedBoot   = curBoot;
+      lastRenderedPage   = curPage;
+      lastRenderedRelay  = relayOn;
+      lastRenderedEmg    = curEmg;
+      lastRenderedOnline = online;
+    };
 
     if (g_uiTrans.active) {
       if ((nowMs - g_uiTrans.lastStepMs) < g_uiTrans.stepDelayMs) {
-        vTaskDelay(pdMS_TO_TICKS(8));
+        vTaskDelay(pdMS_TO_TICKS(UI_TRANS_TICK_MS));
         continue;
       }
       g_uiTrans.lastStepMs = nowMs;
@@ -2670,78 +3516,46 @@ void taskDisplayLcdCore0(void* pvParameters) {
         if (g_uiTrans.step >= 2) {
           g_uiTrans.exitDone = true;
           g_uiTrans.step     = 0;
-          portENTER_CRITICAL(&g_stateMux);
-          g_needFullClear = false;
-          portEXIT_CRITICAL(&g_stateMux);
         }
-        vTaskDelay(pdMS_TO_TICKS(8));
-        continue;
-      } else {
-        uint8_t stage = g_uiTrans.step;
-        animateEnterComponentStage(stage);
-
-        if (curBoot == BOOT_WAIT_FINGERPRINT) {
-          bool r503Ok = g_r503Ok.load(std::memory_order_acquire);
-          uint8_t r503Err = g_lastR503Err.load(std::memory_order_acquire);
-          bool rtcOk = g_rtcOk.load(std::memory_order_acquire);
-          bool rtcLp = g_rtcLostPower.load(std::memory_order_acquire);
-          renderBootLockScreen(false, curEmg, r503Ok, r503Err, rtcOk, rtcLp, stage);
-        } else if (curPage == PAGE_HOME) {
-          bool rtcOk = g_rtcOk.load(std::memory_order_acquire);
-          bool rtcLp = g_rtcLostPower.load(std::memory_order_acquire);
-          renderPageHome(false, relayOn, curEmg, rtcOk, rtcLp, tBuf, dBuf, fBuf, chipTempC, stage);
-        } else if (curPage == PAGE_NAV) {
-          NavTelemetryData navSnap;
-          portENTER_CRITICAL(&g_navMux);
-          navSnap = g_navData;
-          portEXIT_CRITICAL(&g_navMux);
-          bool navOnline = navSnap.bleConnected && navSnap.navActive &&
-                           (navSnap.lastRxMs > 0) && ((nowMs - navSnap.lastRxMs) < NAV_TIMEOUT_MS);
-          renderPageNav(false, relayOn, curEmg, navSnap, navOnline, stage);
-        } else if (curPage == PAGE_TCI) {
-          TelemetryData snap;
-          unsigned long lastRx;
-          uint8_t histCopy[ADV_HIST_LEN];
-          int hIdx;
-          portENTER_CRITICAL(&g_tciMux);
-          snap   = g_tciPkt;
-          lastRx = g_lastTciRxMs;
-          memcpy(histCopy, g_advHistory, ADV_HIST_LEN);
-          hIdx   = g_advHistIdx;
-          portEXIT_CRITICAL(&g_tciMux);
-
-          bool online = (lastRx > 0) && ((nowMs - lastRx) < TCI_TIMEOUT_MS);
-          uint8_t subPage = getTciSubPageAtomic();
-          if (subPage == 0) {
-            renderPageTciDashboard(false, relayOn, curEmg, snap, online, stage);
-          } else {
-            renderPageTciCurve(false, relayOn, curEmg, snap, histCopy, hIdx, online, stage);
-          }
-        }
-
-        g_uiTrans.step++;
-        if (g_uiTrans.step >= 3) {
-          g_uiTrans.active    = false;
-          g_uiTrans.mode      = UI_TRANS_NONE;
-          lastRenderedBoot    = curBoot;
-          lastRenderedPage    = curPage;
-          lastRenderedSub     = getTciSubPageAtomic();
-          lastRenderedRelay   = relayOn;
-          lastRenderedEmg     = curEmg;
-        }
-        vTaskDelay(pdMS_TO_TICKS(8));
+        vTaskDelay(pdMS_TO_TICKS(UI_TRANS_TICK_MS));
         continue;
       }
+
+      const uint8_t stage = g_uiTrans.step;
+      animateEnterComponentStage(stage);
+
+      if (curBoot == BOOT_WAIT_FINGERPRINT) {
+        renderBootLockScreen(false, curEmg, r503Ok, r503Err, rtcOk, rtcLp, stage);
+      } else if (curPage == PAGE_HOME) {
+        renderPageHome(false, relayOn, curEmg, rtcOk, rtcLp, tBuf, dBuf, fBuf, chipTempC,
+                       tciOnline, tciSnap.battVolt10, tciSnap.temp10, homeTickerOffset, stage);
+      } else if (curPage == PAGE_NAV) {
+        bool navOnline;
+        const NavTelemetryData navSnap = snapshotNav(nowMs, navOnline);
+        renderPageNav(false, relayOn, curEmg, navSnap, navOnline, stage);
+      } else if (curPage == PAGE_TCI) {
+        if (curSub == 0) {
+          renderPageTciDashboard(false, relayOn, curEmg, tciSnap, tciOnline, stage);
+        } else {
+          renderPageTciCurve(false, relayOn, curEmg, tciSnap, tciHistCopy, tciHistIdx, tciOnline, stage);
+        }
+      }
+
+      g_uiTrans.step++;
+      if (g_uiTrans.step >= 3) {
+        resetUiTransition();
+        commitCommon(tciOnline);
+        lastRenderedSub = curSub;
+        lastTciSeq      = tciSeq;
+      }
+      vTaskDelay(pdMS_TO_TICKS(UI_TRANS_TICK_MS));
+      continue;
     }
 
     if (curBoot == BOOT_WAIT_FINGERPRINT) {
-      bool r503Ok = g_r503Ok.load(std::memory_order_acquire);
-      uint8_t r503Err = g_lastR503Err.load(std::memory_order_acquire);
-      bool rtcOk = g_rtcOk.load(std::memory_order_acquire);
-      bool rtcLp = g_rtcLostPower.load(std::memory_order_acquire);
-      bool changed = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedEmg != curEmg) ||
-                     (lastRenderedR503 != r503Ok) || (lastRenderedR503Err != r503Err) ||
-                     (lastRenderedRtc != rtcOk) || (lastRenderedRtcLp != rtcLp);
+      const bool changed = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedEmg != curEmg) ||
+                           (lastRenderedR503 != r503Ok) || (lastRenderedR503Err != r503Err) ||
+                           (lastRenderedRtc != rtcOk) || (lastRenderedRtcLp != rtcLp);
       if (changed) {
         renderBootLockScreen(fullClear, curEmg, r503Ok, r503Err, rtcOk, rtcLp, 255);
         lastRenderedBoot    = curBoot;
@@ -2752,77 +3566,61 @@ void taskDisplayLcdCore0(void* pvParameters) {
         lastRenderedRtcLp   = rtcLp;
       }
     } else if (curPage == PAGE_HOME) {
-      bool rtcOk = g_rtcOk.load(std::memory_order_acquire);
-      bool rtcLp = g_rtcLostPower.load(std::memory_order_acquire);
-      bool pageChanged = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedPage != curPage) ||
-                         (lastRenderedRelay != relayOn) || (lastRenderedEmg != curEmg) ||
-                         (lastRenderedRtc != rtcOk) || (lastRenderedRtcLp != rtcLp);
-      if (pageChanged || rtcSeq != lastRtcSeq) {
-        renderPageHome(pageChanged, relayOn, curEmg, rtcOk, rtcLp, tBuf, dBuf, fBuf, chipTempC, 255);
-        lastRenderedBoot  = curBoot;
-        lastRenderedPage  = curPage;
-        lastRenderedRelay = relayOn;
-        lastRenderedEmg   = curEmg;
+      const bool pageChanged = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedPage != curPage) ||
+                               (lastRenderedRelay != relayOn) || (lastRenderedEmg != curEmg) ||
+                               (lastRenderedRtc != rtcOk) || (lastRenderedRtcLp != rtcLp);
+      const bool tickerTick = ((nowMs - lastTickerStepMs) >= TICKER_STEP_MS);
+      if (tickerTick) {
+        lastTickerStepMs = nowMs;
+        homeTickerOffset = (homeTickerOffset + 1) % 256;
+      }
+
+      if (pageChanged || rtcSeq != lastRtcSeq || tciSeq != lastTciSeq || tciOnline != lastRenderedOnline) {
+        renderPageHome(pageChanged, relayOn, curEmg, rtcOk, rtcLp, tBuf, dBuf, fBuf, chipTempC,
+                       tciOnline, tciSnap.battVolt10, tciSnap.temp10, homeTickerOffset, 255);
+        commitCommon(tciOnline);
         lastRenderedRtc   = rtcOk;
         lastRenderedRtcLp = rtcLp;
         lastRtcSeq        = rtcSeq;
+        lastTciSeq        = tciSeq;
+      } else if (tickerTick) {
+        char tickerText[96];
+        buildTickerText(tickerText, sizeof(tickerText), dBuf, rtcOk, rtcLp, fBuf);
+        drawHomeTopBarWithTicker(false, relayOn, curEmg, tickerText, homeTickerOffset);
       }
     } else if (curPage == PAGE_NAV) {
-      NavTelemetryData navSnap;
-      portENTER_CRITICAL(&g_navMux);
-      navSnap = g_navData;
-      portEXIT_CRITICAL(&g_navMux);
-
-      bool navOnline = navSnap.bleConnected && navSnap.navActive &&
-                       (navSnap.lastRxMs > 0) && ((nowMs - navSnap.lastRxMs) < NAV_TIMEOUT_MS);
-      bool pageChanged = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedPage != curPage) ||
-                         (lastRenderedRelay != relayOn) || (lastRenderedEmg != curEmg);
+      bool navOnline;
+      const NavTelemetryData navSnap = snapshotNav(nowMs, navOnline);
+      const bool pageChanged = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedPage != curPage) ||
+                               (lastRenderedRelay != relayOn) || (lastRenderedEmg != curEmg);
       if (pageChanged || navSnap.seq != lastNavSeq || navOnline != lastRenderedOnline) {
         renderPageNav(pageChanged, relayOn, curEmg, navSnap, navOnline, 255);
-        lastRenderedBoot   = curBoot;
-        lastRenderedPage   = curPage;
-        lastRenderedRelay  = relayOn;
-        lastRenderedEmg    = curEmg;
-        lastRenderedOnline = navOnline;
-        lastNavSeq         = navSnap.seq;
+        commitCommon(navOnline);
+        lastNavSeq = navSnap.seq;
       }
     } else if (curPage == PAGE_TCI) {
-      TelemetryData snap;
-      unsigned long lastRx;
-      uint32_t      tciSeq;
-      uint8_t       histCopy[ADV_HIST_LEN];
-      int           hIdx;
-
-      portENTER_CRITICAL(&g_tciMux);
-      snap   = g_tciPkt;
-      lastRx = g_lastTciRxMs;
-      tciSeq = g_tciRxSeq;
-      memcpy(histCopy, g_advHistory, ADV_HIST_LEN);
-      hIdx   = g_advHistIdx;
-      portEXIT_CRITICAL(&g_tciMux);
-
-      bool online = (lastRx > 0) && ((nowMs - lastRx) < TCI_TIMEOUT_MS);
-      uint8_t subPage = getTciSubPageAtomic();
-      bool pageChanged = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedPage != curPage) ||
-                         (lastRenderedSub != subPage) || (lastRenderedRelay != relayOn) ||
-                         (lastRenderedEmg != curEmg);
-      if (pageChanged || online != lastRenderedOnline || tciSeq != lastTciSeq) {
-        if (subPage == 0) {
-          renderPageTciDashboard(pageChanged, relayOn, curEmg, snap, online, 255);
-        } else {
-          renderPageTciCurve(pageChanged, relayOn, curEmg, snap, histCopy, hIdx, online, 255);
+      const bool pageChanged = fullClear || (lastRenderedBoot != curBoot) || (lastRenderedPage != curPage) ||
+                               (lastRenderedSub != curSub) || (lastRenderedRelay != relayOn) ||
+                               (lastRenderedEmg != curEmg);
+      if (pageChanged || tciOnline != lastRenderedOnline || tciSeq != lastTciSeq) {
+        bool drawn = false;
+        if (curSub == 0) {
+          renderPageTciDashboard(pageChanged, relayOn, curEmg, tciSnap, tciOnline, 255);
+          drawn = true;
+        } else if (pageChanged || tciOnline != lastRenderedOnline || ((nowMs - lastCurveDrawMs) >= CURVE_REDRAW_MS)) {
+          lastCurveDrawMs = nowMs;
+          renderPageTciCurve(pageChanged, relayOn, curEmg, tciSnap, tciHistCopy, tciHistIdx, tciOnline, 255);
+          drawn = true;
         }
-        lastRenderedBoot   = curBoot;
-        lastRenderedPage   = curPage;
-        lastRenderedSub    = subPage;
-        lastRenderedRelay  = relayOn;
-        lastRenderedEmg    = curEmg;
-        lastRenderedOnline = online;
-        lastTciSeq         = tciSeq;
+        if (drawn) {
+          commitCommon(tciOnline);
+          lastRenderedSub = curSub;
+          lastTciSeq      = tciSeq;
+        }
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(16));
+    vTaskDelay(pdMS_TO_TICKS(UI_FRAME_MS));
   }
 }
 
@@ -2830,31 +3628,24 @@ void taskDisplayLcdCore0(void* pvParameters) {
 // SETUP & LOOP
 // ============================================================================
 void setup() {
-  pinMode(PIN_RELAY, OUTPUT);
-  digitalWrite(PIN_RELAY, LOW);
-
-  pinMode(PIN_RELAY_SEAT, OUTPUT);
-  digitalWrite(PIN_RELAY_SEAT, LOW);
-
-  pinMode(PIN_LED_NOTIF, OUTPUT);
-  digitalWrite(PIN_LED_NOTIF, LOW);
-
-  pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
-
-  pinMode(PIN_BTN_MAIN, INPUT_PULLUP);
-  pinMode(PIN_BTN_EMRG, INPUT_PULLUP);
-  pinMode(PIN_BTN_ENROLL, INPUT_PULLUP);
+  for (const int pin : {PIN_RELAY, PIN_RELAY_SEAT, PIN_LED_NOTIF, PIN_BUZZER}) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  }
+  for (const int pin : {PIN_BTN_MAIN, PIN_BTN_EMRG, PIN_BTN_ENROLL}) {
+    pinMode(pin, INPUT_PULLUP);
+  }
 
   Serial.begin(115200);
 
   g_i2cMutex  = xSemaphoreCreateMutex();
   g_nvsMutex  = xSemaphoreCreateMutex();
   g_r503Mutex = xSemaphoreCreateMutex();
-  g_core0CmdQueue = xQueueCreate(16, sizeof(Core0Command));
-  g_espNowRxQueue = xQueueCreate(16, sizeof(EspNowRawFrame));
+  g_core0CmdQueue  = xQueueCreate(16, sizeof(Core0Command));
+  g_espNowRxQueue  = xQueueCreate(16, sizeof(EspNowRawFrame));
+  g_enrollCmdQueue = xQueueCreate(8, sizeof(EnrollCommand));
 
-  if (!g_i2cMutex || !g_nvsMutex || !g_r503Mutex || !g_core0CmdQueue || !g_espNowRxQueue) {
+  if (!g_i2cMutex || !g_nvsMutex || !g_r503Mutex || !g_core0CmdQueue || !g_espNowRxQueue || !g_enrollCmdQueue) {
     Serial.println("[FATAL] Alokasi RTOS gagal!");
     delay(1000);
     ESP.restart();
@@ -2862,13 +3653,9 @@ void setup() {
 
   loadPersistentSettings();
 
-  if (g_emergencyByPass) {
-    setSystemStateAtomic(BOOT_UNLOCKED_ACTIVE, PAGE_HOME, false, true);
-  } else {
-    setSystemStateAtomic(BOOT_WAIT_FINGERPRINT, PAGE_HOME, false, true);
-  }
+  setSystemStateAtomic(g_emergencyByPass ? BOOT_UNLOCKED_ACTIVE : BOOT_WAIT_FINGERPRINT, PAGE_HOME, false, true);
   applyRelayOutput();
-  setTciGateForPage(false);
+  syncTelemetryGate(PAGE_HOME);
 
   initLcdBacklightPwm();
   lcd.init();
@@ -2876,42 +3663,47 @@ void setup() {
   lcd.fillScreen(TFT_BLACK);
   lcd.setTextColor(TFT_CYAN, TFT_BLACK);
   lcd.setTextSize(2);
-  lcd.setCursor(45, 110);
+  lcd.setCursor(45, 78);
   lcd.print("BOOTING SYSTEM...");
 
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_CLOCK_HZ);
-  Wire.setTimeOut(50);
-  if (g_i2cMutex && xSemaphoreTake(g_i2cMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-    if (rtc.begin(&Wire)) {
+  beginI2c();
+  {
+    ScopedLock lock(g_i2cMutex, 200);
+    if (lock && rtc.begin(&Wire)) {
       g_rtcOk.store(true, std::memory_order_release);
       if (rtc.lostPower()) {
         g_rtcLostPower.store(true, std::memory_order_release);
       }
     }
-    xSemaphoreGive(g_i2cMutex);
   }
   updateRtcCache();
   updateAdaptiveBacklight();
 
   r503Serial.begin(57600, SERIAL_8N1, PIN_R503_RX, PIN_R503_TX);
-  if (g_r503Mutex && xSemaphoreTake(g_r503Mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-    bool r503Ready = false;
-    for (int attempt = 0; attempt < 3; attempt++) {
-      if (finger.verifyPassword()) {
-        r503Ready = true;
-        break;
+  {
+    ScopedLock lock(g_r503Mutex, 200);
+    if (lock) {
+      bool r503Ready = false;
+      for (int attempt = 0; attempt < 3 && !r503Ready; attempt++) {
+        if (finger.verifyPassword()) {
+          r503Ready = true;
+          applyR503DefaultConfig();
+        } else {
+          delay(40);
+        }
       }
-      delay(40);
+      g_r503Ok.store(r503Ready, std::memory_order_release);
+      if (!r503Ready) {
+        g_lastR503Err.store(FINGERPRINT_PACKETRECIEVEERR, std::memory_order_release);
+      }
     }
-    g_r503Ok.store(r503Ready, std::memory_order_release);
-    if (!r503Ready) {
-      g_lastR503Err.store(FINGERPRINT_PACKETRECIEVEERR, std::memory_order_release);
-    }
-    xSemaphoreGive(g_r503Mutex);
   }
 
+  BLEDevice::init(BLE_DEVICE_NAME);
   watch.begin();
   watch.set24Hour(true);
+
+  startBootEnrollWebServer();
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   esp_task_wdt_config_t wdtCfg = {
@@ -2919,30 +3711,16 @@ void setup() {
     .idle_core_mask = 0,
     .trigger_panic  = true
   };
-  esp_task_wdt_init(&wdtCfg);
+  if (esp_task_wdt_init(&wdtCfg) == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&wdtCfg);
+  }
 #else
   esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
 #endif
 
-  xTaskCreatePinnedToCore(
-    taskImmobilizerCore1,
-    "ImmobCore1",
-    4096,
-    nullptr,
-    4,
-    nullptr,
-    CORE_SECURITY
-  );
-
-  xTaskCreatePinnedToCore(
-    taskDisplayLcdCore0,
-    "LcdCommCore0",
-    12288,
-    nullptr,
-    2,
-    nullptr,
-    CORE_COMM_UI
-  );
+  xTaskCreatePinnedToCore(taskImmobilizerCore1, "ImmobCore1", 5120, nullptr, 4, nullptr, CORE_SECURITY);
+  xTaskCreatePinnedToCore(taskCommCore0,        "CommCore0",  6144, nullptr, 3, nullptr, CORE_COMM_UI);
+  xTaskCreatePinnedToCore(taskDisplayLcdCore0,  "LcdUiCore0", 8192, nullptr, 2, nullptr, CORE_COMM_UI);
 }
 
 void loop() {
