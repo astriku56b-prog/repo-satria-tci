@@ -14,55 +14,50 @@
 #include <NimBLEScan.h>
 #include <NimBLEAdvertisedDevice.h>
 #include <atomic>
-#include <initializer_list>
 #include <cstring>
 #include <cctype>
 #include <string>
 #include "common_proto.h"
 
 // ============================================================================
-// KONFIGURASI PIN & HARDWARE (DISESUAIKAN UNTUK BOARD ESP32-S3 ST7789 170x320)
+// KONFIGURASI PIN & HARDWARE (ESP32-S3 ST7789 170x320)
 // ============================================================================
-// Pin LCD Internal (tersolder di PCB, jangan dipakai untuk I/O lain)
 constexpr int PIN_LCD_RST  = 5;
 constexpr int PIN_LCD_CS   = 6;
 constexpr int PIN_LCD_DC   = 7;
 constexpr int PIN_LCD_SCLK = 8;
 constexpr int PIN_LCD_MOSI = 9;
-constexpr int PIN_LCD_BL   = 38; // Backlight LCD bawaan board (PWM aktif-HIGH)
+constexpr int PIN_LCD_BL   = 38;
 
-// Pin Header Eksternal yang Tersedia pada Board
-constexpr int PIN_BTN_MAIN   = 1;  // Tombol utama (navigasi/jok/mode/relock)
-constexpr int PIN_BTN_EMRG   = 2;  // Tombol emergency bypass (tahan 3.5s)
-constexpr int PIN_BTN_ENROLL = 3;  // Cadangan / tidak dipakai untuk enroll (dikontrol via Web Server)
+constexpr int PIN_BTN_MAIN   = 1;
+constexpr int PIN_BTN_EMRG   = 2;
+constexpr int PIN_BTN_ENROLL = 3;
 
-constexpr int PIN_RELAY      = 10; // Relay utama pengapian / kontak
-constexpr int PIN_RELAY_SEAT = 11; // Relay pembuka jok elektrik
-constexpr int PIN_LED_NOTIF  = 12; // LED indikator notifikasi/status
-constexpr int PIN_BUZZER     = 13; // Buzzer aktif notifikasi
+constexpr int PIN_RELAY      = 10;
+constexpr int PIN_RELAY_SEAT = 11;
+constexpr int PIN_LED_NOTIF  = 12;
+constexpr int PIN_BUZZER     = 13;
 
-constexpr int PIN_I2C_SDA  = 16; // I2C SDA untuk RTC DS3231
-constexpr int PIN_I2C_SCL  = 21; // I2C SCL untuk RTC DS3231
+constexpr int PIN_I2C_SDA  = 16;
+constexpr int PIN_I2C_SCL  = 21;
 
-constexpr int PIN_R503_RX  = 17; // UART2 RX (terhubung ke TX sensor R503)
-constexpr int PIN_R503_TX  = 18; // UART2 TX (terhubung ke RX sensor R503)
+constexpr int PIN_R503_RX  = 17;
+constexpr int PIN_R503_TX  = 18;
 
-// PWM Backlight LCD (Siang & Malam otomatis via RTC)
-constexpr uint8_t  LCD_BL_PWM_CH      = 0;
-constexpr uint32_t LCD_BL_PWM_FREQ    = 5000;
-constexpr uint8_t  LCD_BL_PWM_RES     = 8;
-constexpr uint8_t  LCD_BL_DUTY_DAY    = 240; // ~94% kecerahan siang (06:00 - 17:59)
-constexpr uint8_t  LCD_BL_DUTY_NIGHT  = 115; // ~45% kecerahan malam (18:00 - 05:59)
-constexpr uint16_t COL_FRAME          = 0x2104; // abu gelap untuk bingkai kartu UI
+constexpr uint8_t  LCD_BL_PWM_CH     = 0;
+constexpr uint32_t LCD_BL_PWM_FREQ   = 5000;
+constexpr uint8_t  LCD_BL_PWM_RES    = 8;
+constexpr uint8_t  LCD_BL_DUTY_DAY   = 240;
+constexpr uint8_t  LCD_BL_DUTY_NIGHT = 115;
+constexpr uint16_t COL_FRAME         = 0x2104;
 
 // ============================================================================
-// KONFIGURASI PROTOKOL, SMARTWATCH IMMOBILIZER, WEB ENROLL & AMBANG BATAS
+// KONFIGURASI PROTOKOL, SMARTWATCH, WEB ENROLL & AMBANG BATAS
 // ============================================================================
 constexpr uint8_t TCI_WIFI_CHANNEL = 1;
 static const uint8_t HUD_S3_CUSTOM_MAC[6] = {0x02, 0x53, 0x46, 0x55, 0x48, 0x55};
 static const uint8_t DEFAULT_C3_MAC[6]     = {0x02, 0x53, 0x46, 0x55, 0x43, 0x33};
 
-// Smartwatch Immobilizer (one-shot saat daya nyala sampai relay ON)
 static constexpr char TARGET_WATCH_NAME[]   = "Galaxy Watch4 (3M7H)";
 static constexpr int  WATCH_UNLOCK_RSSI_MIN = -75;
 static constexpr unsigned long WATCH_SCAN_INTERVAL_MS = 1500;
@@ -70,22 +65,15 @@ static constexpr unsigned long WATCH_SCAN_WINDOW_MS   = 80;
 
 static constexpr char WEB_AP_SSID[] = "Satria-HUD-R503";
 static constexpr char WEB_AP_PASS[] = "satria1234";
-static constexpr unsigned long WEB_BOOT_WINDOW_MS = 30000; // Aktif 30 detik saat awal dinyalakan
+static constexpr unsigned long WEB_BOOT_WINDOW_MS = 30000;
 
-// Kunci MAC peer C3 setelah pairing pertama kali agar aman dari paket asing di parkiran
-constexpr bool STRICT_C3_PEER_LOCK = true;
+constexpr bool STRICT_C3_PEER_LOCK     = true;
+constexpr bool ALLOW_INITIAL_C3_LEARN  = true;
+constexpr bool RESET_EMG_ON_BOOT       = true;
 
-// Izinkan pembelajaran MAC C3 baru jika belum terkunci di NVS
-constexpr bool ALLOW_INITIAL_C3_LEARN = true;
-
-// Reset emergency bypass saat boot agar relay tidak menyala otomatis tanpa autentikasi ulang
-constexpr bool RESET_EMG_ON_BOOT = true;
-
-// Batas percobaan gagal sidik jari sebelum jeda cooldown
 constexpr uint8_t       FINGER_MAX_FAIL_STREAK = 10;
 constexpr unsigned long FINGER_FAIL_COOLDOWN_MS = 5000;
 
-// Interval polling navigasi & notifikasi Chronos (ms)
 constexpr unsigned long NAV_POLL_MS   = 150;
 constexpr unsigned long NOTIF_POLL_MS = 150;
 
@@ -95,33 +83,33 @@ constexpr char NVS_NAMESPACE[]   = "satria_hud";
 constexpr BaseType_t CORE_COMM_UI  = 0;
 constexpr BaseType_t CORE_SECURITY = 1;
 
-constexpr uint16_t MAX_RPM_SCALE        = 14000;
-constexpr uint16_t IDLE_MAX_RPM_MODE    = 400;
-constexpr uint16_t RPM_WARN_YELLOW      = 7500;
-constexpr uint16_t RPM_WARN_RED         = 10500;
+constexpr uint16_t MAX_RPM_SCALE     = 14000;
+constexpr uint16_t IDLE_MAX_RPM_MODE = 400;
+constexpr uint16_t RPM_WARN_YELLOW   = 7500;
+constexpr uint16_t RPM_WARN_RED      = 10500;
 
-constexpr uint16_t BATT_MIN_WARN_10     = 115; // 11.5V
-constexpr uint16_t BATT_MAX_WARN_10     = 155; // 15.5V
-constexpr int16_t  ENG_TEMP_WARN_10     = 950; // 95.0C
+constexpr uint16_t BATT_MIN_WARN_10 = 115;
+constexpr uint16_t BATT_MAX_WARN_10 = 155;
+constexpr int16_t  ENG_TEMP_WARN_10 = 950;
 
-constexpr unsigned long DEBOUNCE_MS         = 50;
-constexpr unsigned long LONG_PRESS_MS       = 3000;
-constexpr unsigned long SEAT_MAX_HOLD_MS    = 8000;
-constexpr unsigned long EMERGENCY_HOLD_MS   = 3500;
-constexpr unsigned long DOUBLE_TAP_MS       = 300;
-constexpr unsigned long TCI_TIMEOUT_MS      = 1500;
-constexpr unsigned long NAV_TIMEOUT_MS      = 10000;
-constexpr unsigned long NOTIF_POPUP_MS      = 5000;
-constexpr unsigned long MODE_RETRY_INT_MS   = 450;
-constexpr unsigned long ENROLL_STEP_TMO_MS  = 6000;
-constexpr uint16_t      FINGER_MAX_SLOTS    = 127;
+constexpr unsigned long DEBOUNCE_MS        = 50;
+constexpr unsigned long LONG_PRESS_MS      = 3000;
+constexpr unsigned long SEAT_MAX_HOLD_MS   = 8000;
+constexpr unsigned long EMERGENCY_HOLD_MS  = 3500;
+constexpr unsigned long DOUBLE_TAP_MS      = 300;
+constexpr unsigned long TCI_TIMEOUT_MS     = 1500;
+constexpr unsigned long NAV_TIMEOUT_MS     = 10000;
+constexpr unsigned long NOTIF_POPUP_MS     = 5000;
+constexpr unsigned long MODE_RETRY_INT_MS  = 450;
+constexpr unsigned long ENROLL_STEP_TMO_MS = 6000;
+constexpr uint16_t      FINGER_MAX_SLOTS   = 127;
 
-constexpr int      ADV_HIST_LEN         = 160;
-constexpr uint32_t WDT_TIMEOUT_SEC      = 5;
-constexpr uint32_t I2C_CLOCK_HZ         = 100000;
-constexpr uint8_t  MODE_SEND_MAX_RETRY  = 5;
+constexpr int      ADV_HIST_LEN        = 160;
+constexpr uint32_t WDT_TIMEOUT_SEC     = 5;
+constexpr uint32_t I2C_CLOCK_HZ        = 100000;
+constexpr uint8_t  MODE_SEND_MAX_RETRY = 5;
 
-constexpr unsigned long STACK_CHECK_MS   = 60000; // interval cek sisa stack tiap task
+constexpr unsigned long STACK_CHECK_MS   = 60000;
 constexpr UBaseType_t   STACK_WARN_WORDS = 512;
 constexpr unsigned long DIAG_LOG_MS      = 30000;
 constexpr unsigned long RTC_READ_MS      = 500;
@@ -143,11 +131,11 @@ constexpr uint8_t STATE_RUNNING   = 2;
 constexpr uint8_t STATE_LIMP_HOME = 3;
 
 // ============================================================================
-// DRIVER LAYAR LOVYANGFX (ST7789 170x320 -> Rotasi 1 = 320x170 Landscape)
+// DRIVER LOVYANGFX (ST7789 170x320)
 // ============================================================================
 class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ST7789  _panel_instance;
-  lgfx::Bus_SPI       _bus_instance;
+  lgfx::Panel_ST7789 _panel_instance;
+  lgfx::Bus_SPI      _bus_instance;
 
 public:
   LGFX(void) {
@@ -211,7 +199,6 @@ static std::atomic<bool> g_webServerActive{false};
 static std::atomic<bool> g_webServerExpired{false};
 static unsigned long g_webBootStartMs = 0;
 
-// State one-shot BLE smartwatch scan (aktif saat daya masuk sampai relay ON)
 static std::atomic<bool>          g_watchOneShotMatched{false};
 static std::atomic<bool>          g_watchScanFinished{false};
 static std::atomic<bool>          g_watchScanInProgress{false};
@@ -220,7 +207,7 @@ static std::atomic<int>           g_watchMatchedRssi{-127};
 static NimBLEScan* g_pWatchScan = nullptr;
 
 // ============================================================================
-// STRUKTUR PAKET TELEMETRI & PERINTAH
+// STRUKTUR TELEMETRI & PERINTAH
 // ============================================================================
 #ifndef COMMON_PROTO_STRUCTS_DEFINED
 #define COMMON_PROTO_STRUCTS_DEFINED
@@ -261,8 +248,8 @@ static uint16_t calculateCRC16(const uint8_t *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     crc ^= static_cast<uint16_t>(data[i]) << 8;
     for (uint8_t j = 0; j < 8; j++) {
-      if (crc & 0x8000) crc = static_cast<uint16_t>((crc << 1) ^ 0x1021);
-      else crc = static_cast<uint16_t>(crc << 1);
+      crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021)
+                           : static_cast<uint16_t>(crc << 1);
     }
   }
   return crc;
@@ -270,7 +257,6 @@ static uint16_t calculateCRC16(const uint8_t *data, size_t len) {
 
 static uint16_t getRedlineRPM(uint8_t mode) {
   switch (mode) {
-    case 0:  return 9000;
     case 1:  return 11000;
     case 2:  return 12000;
     case 3:  return 11500;
@@ -279,7 +265,7 @@ static uint16_t getRedlineRPM(uint8_t mode) {
 }
 
 // ============================================================================
-// STRUKTUR NAVIGASI & NOTIFIKASI CHRONOS
+// NAVIGASI & NOTIFIKASI CHRONOS
 // ============================================================================
 enum NavTurnType : uint8_t {
   NAV_TURN_NONE = 0,
@@ -327,7 +313,7 @@ static portMUX_TYPE g_notifMux = portMUX_INITIALIZER_UNLOCKED;
 static NotifPopupData g_notifPopup = {false, "", "", "", 0, NOTIF_POPUP_MS, 0};
 
 // ============================================================================
-// STATE SISTEM, ENROLL WEB & SINKRONISASI RTOS
+// STATE SISTEM, ENROLL WEB & RTOS
 // ============================================================================
 enum BootState : uint8_t {
   BOOT_WAIT_FINGERPRINT = 0,
@@ -440,12 +426,12 @@ static volatile bool    g_c3MacLocked       = false;
 static volatile bool    g_newPeerPending    = false;
 static uint8_t          g_pendingPeerMac[6] = {0};
 
-static QueueHandle_t g_core0CmdQueue   = nullptr;
-static QueueHandle_t g_espNowRxQueue   = nullptr;
-static QueueHandle_t g_enrollCmdQueue  = nullptr;
+static QueueHandle_t g_core0CmdQueue  = nullptr;
+static QueueHandle_t g_espNowRxQueue  = nullptr;
+static QueueHandle_t g_enrollCmdQueue = nullptr;
 
 // ============================================================================
-// UTILITAS DASAR
+// UTILITAS & LOCK
 // ============================================================================
 static inline void copyStr(char *dst, size_t dstSize, const char *src) {
   if (!dst || dstSize == 0) return;
@@ -512,7 +498,7 @@ static void requestStopWatchScanOnce();
 static void serviceStopWatchScanOnCore0();
 
 // ============================================================================
-// HELPER UTILITAS, PWM BACKLIGHT & NVS PERSISTENCE
+// PWM BACKLIGHT & NVS
 // ============================================================================
 static inline bool isTimerActive(unsigned long startMs, unsigned long durationMs, unsigned long nowMs) {
   return (durationMs > 0) && ((nowMs - startMs) < durationMs);
@@ -541,9 +527,7 @@ static void updateAdaptiveBacklight() {
   uint8_t targetDuty = LCD_BL_DUTY_DAY;
   if (g_rtcOk.load(std::memory_order_acquire)) {
     uint8_t hr = g_rtcHour.load(std::memory_order_acquire);
-    if (hr >= 18 || hr < 6) {
-      targetDuty = LCD_BL_DUTY_NIGHT;
-    }
+    if (hr >= 18 || hr < 6) targetDuty = LCD_BL_DUTY_NIGHT;
   }
   if (targetDuty != lastDuty) {
     lastDuty = targetDuty;
@@ -610,23 +594,16 @@ static void sanitizeAsciiInPlace(char *s, bool replaceNewlineWithSpace = true) {
   for (size_t r = 0; s[r] != '\0'; r++) {
     unsigned char ch = static_cast<unsigned char>(s[r]);
     if (ch == '\r') continue;
-    if (ch == '\n') {
-      s[w++] = replaceNewlineWithSpace ? ' ' : '\n';
-    } else if (ch >= 0x20 && ch <= 0x7E) {
-      s[w++] = static_cast<char>(ch);
-    } else {
-      s[w++] = '?';
-    }
+    if (ch == '\n') s[w++] = replaceNewlineWithSpace ? ' ' : '\n';
+    else if (ch >= 0x20 && ch <= 0x7E) s[w++] = static_cast<char>(ch);
+    else s[w++] = '?';
   }
   s[w] = '\0';
 }
 
 static void formatJsonEscaped(const char *src, char *dst, size_t dstSize) {
   if (!dst || dstSize == 0) return;
-  if (!src) {
-    dst[0] = '\0';
-    return;
-  }
+  if (!src) { dst[0] = '\0'; return; }
   size_t w = 0;
   for (size_t r = 0; src[r] != '\0' && w + 2 < dstSize; r++) {
     unsigned char ch = static_cast<unsigned char>(src[r]);
@@ -649,12 +626,8 @@ static void trimAsciiInPlace(char *s) {
     s[--len] = '\0';
   }
   size_t start = 0;
-  while (s[start] == ' ' || s[start] == '\r' || s[start] == '\n' || s[start] == '\t') {
-    start++;
-  }
-  if (start > 0) {
-    memmove(s, s + start, len - start + 1);
-  }
+  while (s[start] == ' ' || s[start] == '\r' || s[start] == '\n' || s[start] == '\t') start++;
+  if (start > 0) memmove(s, s + start, len - start + 1);
 }
 
 template <size_t N>
@@ -704,9 +677,7 @@ static inline void applyRelayOutput(unsigned long nowMs = 0) {
   }
   digitalWrite(PIN_RELAY, relayOn ? HIGH : LOW);
   digitalWrite(PIN_RELAY_SEAT, seatOn ? HIGH : LOW);
-  if (relayOn) {
-    requestStopWatchScanOnce();
-  }
+  if (relayOn) requestStopWatchScanOnce();
 }
 
 static void setSeatRelayHold(bool active, unsigned long nowMs = 0) {
@@ -772,7 +743,7 @@ static void triggerPopup(const char* l1, const char* l2, uint16_t bgColor, uint1
 }
 
 // ============================================================================
-// ONE-SHOT SMARTWATCH BLE IMMOBILIZER (NIMBLE 2.x, TARGET: "Galaxy Watch4 (3M7H)")
+// ONE-SHOT SMARTWATCH BLE IMMOBILIZER (NIMBLE 2.x)
 // ============================================================================
 class WatchOneShotCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
@@ -816,14 +787,12 @@ static void pollWatchOneShotScan(unsigned long nowMs) {
 
   serviceStopWatchScanOnCore0();
 
-  // Berhenti permanen setelah relay ON sampai daya diputus / boot ulang
   if (g_watchScanFinished.load(std::memory_order_acquire) || isRelayAuthorizedAtomic()) {
     requestStopWatchScanOnce();
     serviceStopWatchScanOnCore0();
     return;
   }
 
-  // Tunda saat Web Server AP aktif agar radio 2.4 GHz tidak bentrok
   if (g_webServerActive.load(std::memory_order_acquire)) return;
 
   if (g_pWatchScan == nullptr) {
@@ -837,7 +806,6 @@ static void pollWatchOneShotScan(unsigned long nowMs) {
   }
   if (g_pWatchScan == nullptr) return;
 
-  // Akhiri window scan secara non-blocking pada Core 0
   if (g_watchScanInProgress.load(std::memory_order_acquire)) {
     if ((nowMs - g_watchScanStartMs.load(std::memory_order_acquire)) >= WATCH_SCAN_WINDOW_MS ||
         g_watchOneShotMatched.load(std::memory_order_acquire)) {
@@ -901,9 +869,7 @@ static void updateRtcCache() {
   snprintf(dBuf, sizeof(dBuf), "%02d-%02d-%04d", now.day(), now.month(), now.year());
 
   float chipC = temperatureRead();
-  if (isnan(chipC) || chipC < -20.0f || chipC > 125.0f) {
-    chipC = 0.0f;
-  }
+  if (isnan(chipC) || chipC < -20.0f || chipC > 125.0f) chipC = 0.0f;
 
   CritSection cs(g_stateMux);
   memcpy(g_timeStr, tBuf, sizeof(g_timeStr));
@@ -913,7 +879,7 @@ static void updateRtcCache() {
 }
 
 // ============================================================================
-// INDIKATOR LED & BUZZER NOTIFIKASI (NON-BLOCKING)
+// INDIKATOR LED & BUZZER (NON-BLOCKING)
 // ============================================================================
 enum BuzzerPattern : uint8_t {
   BUZZ_NONE = 0,
@@ -979,7 +945,7 @@ static constexpr BuzzSeq BUZZ_SEQS[] = {
   makeSeq(BUZZ_SEQ_ENROLL_OK),
   makeSeq(BUZZ_SEQ_NOTIF)
 };
-static_assert(sizeof(BUZZ_SEQS) / sizeof(BUZZ_SEQS[0]) == BUZZ_NOTIF + 1, "BUZZ_SEQS harus sinkron dengan BuzzerPattern");
+static_assert(sizeof(BUZZ_SEQS) / sizeof(BUZZ_SEQS[0]) == BUZZ_NOTIF + 1, "BUZZ_SEQS mismatch");
 
 static void serviceLedAndBuzzer(bool systemUnlockedOrEmg, unsigned long nowMs = 0) {
   if (nowMs == 0) nowMs = millis();
@@ -1029,7 +995,7 @@ static void serviceLedAndBuzzer(bool systemUnlockedOrEmg, unsigned long nowMs = 
 }
 
 // ============================================================================
-// SENSOR SIDIK JARI R503 & STATE MACHINE ENROLL (EKSKLUSIF DI CORE 1)
+// SENSOR SIDIK JARI R503 & ENROLL (CORE 1)
 // ============================================================================
 static void applyR503DefaultConfig() {
   finger.setSecurityLevel(2);
@@ -1073,9 +1039,7 @@ static int scanFingerprintOnce(uint16_t &outId, int &outConfidence) {
   if (p != FINGERPRINT_OK) {
     if (p != FINGERPRINT_NOFINGER) {
       g_lastR503Err.store(p, std::memory_order_release);
-      if (p == FINGERPRINT_PACKETRECIEVEERR) {
-        g_r503Ok.store(false, std::memory_order_release);
-      }
+      if (p == FINGERPRINT_PACKETRECIEVEERR) g_r503Ok.store(false, std::memory_order_release);
     }
     return -1;
   }
@@ -1135,7 +1099,7 @@ static void abortEnrollSession(const char *reasonMsg, unsigned long nowMs) {
 
 static bool startEnrollSession(unsigned long nowMs) {
   if (!isSystemUnlockedAtomic()) {
-    setWebEnrollState(WEB_ENROLL_ERROR, 0, "Buka kunci HUD dulu sebelum tambah");
+    setWebEnrollState(WEB_ENROLL_ERROR, 0, "Buka kunci HUD dulu");
     return false;
   }
 
@@ -1164,18 +1128,18 @@ static bool startEnrollSession(unsigned long nowMs) {
   g_enrollCtx.stepStartMs     = nowMs;
   g_enrollCtx.lastSlotProbeMs = 0;
 
-  setEnrollStatus(WEB_ENROLL_FIND_SLOT, 0, "Mencari slot kosong di R503...", "CARI SLOT R503...");
-  triggerPopup("WEB ENROLL", "CARI SLOT KOSONG", TFT_CYAN, 1500);
+  setEnrollStatus(WEB_ENROLL_FIND_SLOT, 0, "Cari slot kosong...", "CARI SLOT R503...");
+  triggerPopup("WEB ENROLL", "CARI SLOT", TFT_CYAN, 1500);
   triggerLedAndBuzzer(1, 800, BUZZ_ENROLL_STEP, nowMs);
   return true;
 }
 
 static const char *enrollTimeoutReason(EnrollFsmState st) {
   switch (st) {
-    case ENROLL_FIND_SLOT:     return "TIMEOUT SLOT R503";
-    case ENROLL_WAIT_FINGER_1: return "TIMEOUT JARI 1";
-    case ENROLL_WAIT_LIFT:     return "TIMEOUT ANGKAT";
-    default:                   return "TIMEOUT JARI 2";
+    case ENROLL_FIND_SLOT:     return "TMO SLOT R503";
+    case ENROLL_WAIT_FINGER_1: return "TMO JARI 1";
+    case ENROLL_WAIT_LIFT:     return "TMO ANGKAT";
+    default:                   return "TMO JARI 2";
   }
 }
 
@@ -1207,9 +1171,9 @@ static void stepEnrollFindSlot(unsigned long nowMs) {
     g_enrollCtx.stepStartMs = nowMs;
 
     char msg[56];
-    snprintf(msg, sizeof(msg), "Tempelkan jari 1/2 (Slot #%u)", freeSlot);
+    snprintf(msg, sizeof(msg), "Jari 1/2 (Slot #%u)", freeSlot);
     setEnrollStatus(WEB_ENROLL_WAIT_FINGER_1, freeSlot, msg, "TEMPEL JARI 1/2");
-    triggerPopup("ENROLL JARI 1/2", "TEMPELKAN JARI", TFT_YELLOW, 2200);
+    triggerPopup("ENROLL 1/2", "TEMPEL JARI", TFT_YELLOW, 2200);
     triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP, nowMs);
   } else if (exhausted) {
     abortEnrollSession("MEMORI PENUH", nowMs);
@@ -1226,7 +1190,7 @@ static void stepEnrollCapture(unsigned long nowMs) {
       if (p == FINGERPRINT_OK) {
         if (finger.image2Tz(1) != FINGERPRINT_OK) {
           lock.release();
-          abortEnrollSession("CONV GAGAL #1", nowMs);
+          abortEnrollSession("CONV #1 GAGAL", nowMs);
           return;
         }
         g_enrollCtx.state       = ENROLL_WAIT_LIFT;
@@ -1234,12 +1198,12 @@ static void stepEnrollCapture(unsigned long nowMs) {
         finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0, 0);
         lock.release();
 
-        setEnrollStatus(WEB_ENROLL_WAIT_LIFT, g_enrollCtx.targetSlot, "Angkat jari sebentar...", "ANGKAT JARI...");
+        setEnrollStatus(WEB_ENROLL_WAIT_LIFT, g_enrollCtx.targetSlot, "Angkat jari...", "ANGKAT JARI...");
         triggerLedAndBuzzer(1, 500, BUZZ_ENROLL_STEP, nowMs);
-        triggerPopup("ANGKAT JARI", "TUNGGU SEBENTAR", TFT_CYAN, 2000);
+        triggerPopup("ANGKAT JARI", "TUNGGU...", TFT_CYAN, 2000);
       } else if (p != FINGERPRINT_NOFINGER) {
         lock.release();
-        abortEnrollSession("GAGAL SCAN #1", nowMs);
+        abortEnrollSession("SCAN #1 GAGAL", nowMs);
       }
       break;
     }
@@ -1252,9 +1216,9 @@ static void stepEnrollCapture(unsigned long nowMs) {
         lock.release();
 
         char msg[56];
-        snprintf(msg, sizeof(msg), "Tempelkan jari 2/2 (Slot #%u)", g_enrollCtx.targetSlot);
+        snprintf(msg, sizeof(msg), "Jari 2/2 (Slot #%u)", g_enrollCtx.targetSlot);
         setEnrollStatus(WEB_ENROLL_WAIT_FINGER_2, g_enrollCtx.targetSlot, msg, "TEMPEL JARI 2/2");
-        triggerPopup("ENROLL JARI 2/2", "TEMPEL LAGI", TFT_YELLOW, 2200);
+        triggerPopup("ENROLL 2/2", "TEMPEL LAGI", TFT_YELLOW, 2200);
         triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP, nowMs);
       }
       break;
@@ -1265,12 +1229,12 @@ static void stepEnrollCapture(unsigned long nowMs) {
       if (p == FINGERPRINT_OK) {
         if (finger.image2Tz(2) != FINGERPRINT_OK) {
           lock.release();
-          abortEnrollSession("CONV GAGAL #2", nowMs);
+          abortEnrollSession("CONV #2 GAGAL", nowMs);
           return;
         }
         if (finger.createModel() != FINGERPRINT_OK) {
           lock.release();
-          abortEnrollSession("JARI TDK COCOK", nowMs);
+          abortEnrollSession("TDK COCOK", nowMs);
           return;
         }
 
@@ -1282,14 +1246,14 @@ static void stepEnrollCapture(unsigned long nowMs) {
 
         char readyMsg[56];
         char lcdMsg[32];
-        snprintf(readyMsg, sizeof(readyMsg), "Scan cocok! Klik Simpan untuk Slot #%u", readySlot);
+        snprintf(readyMsg, sizeof(readyMsg), "Siap simpan Slot #%u", readySlot);
         snprintf(lcdMsg, sizeof(lcdMsg), "SIAP SIMPAN #%u", readySlot);
         setEnrollStatus(WEB_ENROLL_READY_TO_SAVE, readySlot, readyMsg, lcdMsg, true);
         triggerPopup("SIAP SIMPAN", lcdMsg, TFT_CYAN, 2200);
         triggerLedAndBuzzer(1, 1000, BUZZ_ENROLL_STEP, nowMs);
       } else if (p != FINGERPRINT_NOFINGER) {
         lock.release();
-        abortEnrollSession("GAGAL SCAN #2", nowMs);
+        abortEnrollSession("SCAN #2 GAGAL", nowMs);
       }
       break;
     }
@@ -1301,12 +1265,10 @@ static void stepEnrollCapture(unsigned long nowMs) {
 
 static void stepEnrollSession(unsigned long nowMs) {
   if (g_enrollCtx.state == ENROLL_IDLE) return;
-
   if ((nowMs - g_enrollCtx.stepStartMs) >= ENROLL_STEP_TMO_MS) {
     abortEnrollSession(enrollTimeoutReason(g_enrollCtx.state), nowMs);
     return;
   }
-
   if (g_enrollCtx.state == ENROLL_FIND_SLOT) stepEnrollFindSlot(nowMs);
   else                                        stepEnrollCapture(nowMs);
 }
@@ -1321,7 +1283,7 @@ static bool saveEnrolledFingerprintToR503(unsigned long nowMs) {
   }
 
   if (st != WEB_ENROLL_READY_TO_SAVE || slot == 0) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Belum ada hasil scan yang siap disimpan");
+    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Belum siap disimpan");
     return false;
   }
 
@@ -1329,7 +1291,7 @@ static bool saveEnrolledFingerprintToR503(unsigned long nowMs) {
   {
     ScopedLock lock(g_r503Mutex, 100);
     if (!lock) {
-      setWebEnrollState(WEB_ENROLL_ERROR, slot, "R503 sibuk saat menyimpan");
+      setWebEnrollState(WEB_ENROLL_ERROR, slot, "R503 sibuk");
       return false;
     }
     p = finger.storeModel(slot);
@@ -1339,7 +1301,7 @@ static bool saveEnrolledFingerprintToR503(unsigned long nowMs) {
   }
 
   if (p != FINGERPRINT_OK) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Gagal menyimpan ke memori R503");
+    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Gagal simpan R503");
     triggerPopup("SIMPAN GAGAL", "CEK R503", TFT_RED, 1800);
     triggerLedAndBuzzer(2, 1200, BUZZ_ALERT, nowMs);
     return false;
@@ -1347,10 +1309,9 @@ static bool saveEnrolledFingerprintToR503(unsigned long nowMs) {
 
   char okWeb[56];
   char okLcd[32];
-  snprintf(okWeb, sizeof(okWeb), "Tersimpan sukses di ID #%u", slot);
+  snprintf(okWeb, sizeof(okWeb), "Tersimpan ID #%u", slot);
   snprintf(okLcd, sizeof(okLcd), "TERSIMPAN #%u", slot);
   setEnrollStatus(WEB_ENROLL_SAVED, slot, okWeb, okLcd, true);
-
   triggerPopup("TERSIMPAN", okLcd, TFT_GREEN, 2000);
   triggerLedAndBuzzer(1, 1500, BUZZ_ENROLL_OK, nowMs);
   return true;
@@ -1358,11 +1319,11 @@ static bool saveEnrolledFingerprintToR503(unsigned long nowMs) {
 
 static bool deleteFingerprintSlotR503(uint16_t slotId, unsigned long nowMs) {
   if (!isSystemUnlockedAtomic()) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Buka kunci HUD dulu sebelum hapus");
+    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Buka kunci HUD dulu");
     return false;
   }
   if (slotId == 0 || slotId > FINGER_MAX_SLOTS) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "ID harus antara 1 - 127");
+    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "ID harus 1-127");
     return false;
   }
 
@@ -1370,22 +1331,22 @@ static bool deleteFingerprintSlotR503(uint16_t slotId, unsigned long nowMs) {
   {
     ScopedLock lock(g_r503Mutex, 100);
     if (!lock) {
-      setWebEnrollState(WEB_ENROLL_ERROR, slotId, "R503 sibuk saat menghapus");
+      setWebEnrollState(WEB_ENROLL_ERROR, slotId, "R503 sibuk");
       return false;
     }
     p = finger.deleteModel(slotId);
   }
 
   if (p != FINGERPRINT_OK) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Gagal hapus ID (slot kosong/error)");
-    triggerPopup("HAPUS GAGAL", "CEK ID R503", TFT_RED, 1600);
+    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Gagal hapus ID");
+    triggerPopup("HAPUS GAGAL", "CEK ID", TFT_RED, 1600);
     triggerLedAndBuzzer(2, 1000, BUZZ_ALERT, nowMs);
     return false;
   }
 
   char msg[56];
   char lcdMsg[32];
-  snprintf(msg, sizeof(msg), "Sidik jari ID #%u dihapus", slotId);
+  snprintf(msg, sizeof(msg), "ID #%u dihapus", slotId);
   snprintf(lcdMsg, sizeof(lcdMsg), "HAPUS ID #%u", slotId);
   setWebEnrollState(WEB_ENROLL_IDLE, 0, msg);
   triggerPopup("ID DIHAPUS", lcdMsg, TFT_CYAN, 1600);
@@ -1401,85 +1362,41 @@ static void serviceEnrollCommandsOnCore1(unsigned long nowMs) {
       case ENROLL_CMD_SAVE:   saveEnrolledFingerprintToR503(nowMs); break;
       case ENROLL_CMD_DELETE: deleteFingerprintSlotR503(cmd.slotId, nowMs); break;
       case ENROLL_CMD_ABORT:
-        if (g_enrollCtx.state != ENROLL_IDLE) abortEnrollSession("ENROLL DIBATALKAN", nowMs);
+        if (g_enrollCtx.state != ENROLL_IDLE) abortEnrollSession("DIBATALKAN", nowMs);
         break;
     }
   }
 }
 
 // ============================================================================
-// WEB SERVER AP (AKTIF 30 DETIK SAAT BOOT, OFF JIKA TIDAK TERHUBUNG HP)
+// WEB SERVER AP (AKTIF 30 DETIK SAAT BOOT)
 // ============================================================================
 static const char ENROLL_WEB_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Satria HUD - R503</title>
-  <style>
-    body{font-family:sans-serif;background:#0f1115;color:#f1f5f9;padding:16px;max-width:460px;margin:auto}
-    .box{background:#1b1f27;border:1px solid #2d3442;border-radius:10px;padding:14px;margin-bottom:12px}
-    h3{margin:0 0 10px 0;font-size:16px;color:#38bdf8}
-    button{padding:10px 14px;border:0;border-radius:8px;font-weight:bold;cursor:pointer;margin:4px 4px 4px 0}
-    button:disabled{opacity:0.4;cursor:not-allowed}
-    .btn-add{background:#22c55e;color:#052e16}
-    .btn-save{background:#3b82f6;color:#fff}
-    .btn-del{background:#ef4444;color:#fff}
-    input{padding:9px;border-radius:8px;border:1px solid #475569;background:#0f1115;color:#fff;width:85px}
-    .status{margin-top:8px;font-size:14px;color:#facc15;min-height:20px}
-  </style>
-</head>
-<body>
-  <h2>R503 Fingerprint Control</h2>
-  <div class="box">
-    <h3>Tambah &amp; Simpan Sidik Jari</h3>
-    <button class="btn-add" onclick="postCmd('/api/add')">Tambah</button>
-    <button class="btn-save" id="btnSave" onclick="postCmd('/api/save')" disabled>Simpan</button>
-    <div class="status" id="st">Memuat status...</div>
-  </div>
-  <div class="box">
-    <h3>Hapus Sidik Jari</h3>
-    <label>ID (1-127): <input type="number" id="slotId" min="1" max="127" value="1"></label>
-    <button class="btn-del" onclick="delId()">Hapus</button>
-  </div>
-<script>
-async function postCmd(url, body){
-  const r = await fetch(url, {method:'POST', body: body||''});
-  const txt = await r.text();
-  document.getElementById('st').innerText = txt;
-  pollStatus();
-}
-function delId(){
-  const id = document.getElementById('slotId').value;
-  postCmd('/api/delete', 'id=' + encodeURIComponent(id));
-}
-async function pollStatus(){
-  try{
-    const r = await fetch('/api/status');
-    if(!r.ok) return;
-    const j = await r.json();
-    document.getElementById('st').innerText = j.msg;
-    document.getElementById('btnSave').disabled = !j.canSave;
-  }catch(e){}
-}
-setInterval(pollStatus, 600);
-pollStatus();
-</script>
-</body>
-</html>
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>R503 HUD</title><style>body{font-family:sans-serif;background:#111;color:#eee;padding:14px;max-width:420px;margin:auto}
+button{padding:9px 12px;border:0;border-radius:6px;font-weight:bold;margin:4px 2px}
+.a{background:#22c55e;color:#000}.s{background:#3b82f6;color:#fff}.d{background:#ef4444;color:#fff}
+input{padding:8px;width:75px;border-radius:6px;border:1px solid #555;background:#222;color:#fff}</style></head>
+<body><h3>R503 Control</h3>
+<button class="a" onclick="f('/api/add')">Tambah</button>
+<button class="s" id="bs" onclick="f('/api/save')" disabled>Simpan</button>
+<div id="st" style="margin:8px 0;color:#facc15">...</div>
+<hr><input type="number" id="id" min="1" max="127" value="1">
+<button class="d" onclick="f('/api/delete','id='+encodeURIComponent(id.value))">Hapus</button>
+<script>async function f(u,b){const r=await fetch(u,{method:'POST',body:b||''});st.innerText=await r.text();p();}
+async function p(){try{const r=await fetch('/api/status');if(!r.ok)return;const j=await r.json();st.innerText=j.msg;bs.disabled=!j.canSave;}catch(e){}}
+setInterval(p,600);p();</script></body></html>
 )HTML";
 
 static void applyEspNowRadioParams(bool disconnectStaFirst) {
-  if (disconnectStaFirst) {
-    WiFi.disconnect(false, false);
-  }
+  if (disconnectStaFirst) WiFi.disconnect(false, false);
   esp_wifi_set_mac(WIFI_IF_STA, HUD_S3_CUSTOM_MAC);
   esp_wifi_set_channel(TCI_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 }
 
 static void replyQueued(bool queued, const char *okMsg) {
-  g_webServer.send(queued ? 202 : 503, "text/plain", queued ? okMsg : "Antrean R503 penuh, coba lagi");
+  g_webServer.send(queued ? 202 : 503, "text/plain", queued ? okMsg : "Antrean penuh");
 }
 
 static void rejectWebRequest(uint16_t slot, const char *msg) {
@@ -1515,7 +1432,7 @@ static void startBootEnrollWebServer() {
     char safeMsg[120];
     formatJsonEscaped(msg, safeMsg, sizeof(safeMsg));
 
-    char json[220];
+    char json[200];
     snprintf(json, sizeof(json), "{\"stage\":%u,\"slot\":%u,\"canSave\":%s,\"msg\":\"%s\"}",
              static_cast<unsigned int>(st),
              static_cast<unsigned int>(slot),
@@ -1526,31 +1443,31 @@ static void startBootEnrollWebServer() {
 
   g_webServer.on("/api/add", HTTP_POST, []() {
     if (!isSystemUnlockedAtomic()) {
-      rejectWebRequest(0, "Buka kunci HUD dulu sebelum tambah");
+      rejectWebRequest(0, "Buka kunci HUD dulu");
       return;
     }
-    replyQueued(enqueueEnrollCommand(ENROLL_CMD_ADD, 0), "Perintah tambah dikirim ke R503...");
+    replyQueued(enqueueEnrollCommand(ENROLL_CMD_ADD, 0), "Tambah dikirim");
   });
 
   g_webServer.on("/api/save", HTTP_POST, []() {
-    replyQueued(enqueueEnrollCommand(ENROLL_CMD_SAVE, 0), "Menyimpan sidik jari ke R503...");
+    replyQueued(enqueueEnrollCommand(ENROLL_CMD_SAVE, 0), "Simpan dikirim");
   });
 
   g_webServer.on("/api/delete", HTTP_POST, []() {
     if (!g_webServer.hasArg("id")) {
-      g_webServer.send(400, "text/plain", "ID slot wajib diisi");
+      g_webServer.send(400, "text/plain", "ID wajib diisi");
       return;
     }
     const uint16_t slotId = static_cast<uint16_t>(g_webServer.arg("id").toInt());
     if (!isSystemUnlockedAtomic()) {
-      rejectWebRequest(slotId, "Buka kunci HUD dulu sebelum hapus");
+      rejectWebRequest(slotId, "Buka kunci HUD dulu");
       return;
     }
     if (slotId == 0 || slotId > FINGER_MAX_SLOTS) {
-      rejectWebRequest(slotId, "ID harus antara 1 - 127");
+      rejectWebRequest(slotId, "ID 1-127");
       return;
     }
-    replyQueued(enqueueEnrollCommand(ENROLL_CMD_DELETE, slotId), "Menghapus ID sidik jari...");
+    replyQueued(enqueueEnrollCommand(ENROLL_CMD_DELETE, slotId), "Hapus dikirim");
   });
 
   g_webServer.begin();
@@ -1571,21 +1488,19 @@ static void stopBootEnrollWebServer() {
 
   g_webServerActive.store(false, std::memory_order_release);
   g_webServerExpired.store(true, std::memory_order_release);
-  setWebEnrollState(WEB_ENROLL_IDLE, 0, "Web server nonaktif (batas 30 detik)");
+  setWebEnrollState(WEB_ENROLL_IDLE, 0, "Web nonaktif");
 }
 
 static void serviceBootEnrollWebServer(unsigned long nowMs) {
   if (!g_webServerActive.load(std::memory_order_acquire)) return;
-
   g_webServer.handleClient();
-
   if ((nowMs - g_webBootStartMs) >= WEB_BOOT_WINDOW_MS && WiFi.softAPgetStationNum() == 0) {
     stopBootEnrollWebServer();
   }
 }
 
 // ============================================================================
-// KOMUNIKASI ESP-NOW TCI
+// ESP-NOW TCI
 // ============================================================================
 static void recordEspSendResult(bool ok) {
   CritSection cs(g_stateMux);
@@ -1653,9 +1568,7 @@ static bool sendModePacket(uint8_t mode) {
   }
 
   const esp_err_t res = esp_now_send(destMac, reinterpret_cast<const uint8_t*>(&cmd), sizeof(CommandData));
-  if (res != ESP_OK) {
-    g_diagTxFail.fetch_add(1, std::memory_order_relaxed);
-  }
+  if (res != ESP_OK) g_diagTxFail.fetch_add(1, std::memory_order_relaxed);
 
   const unsigned long nowMs = millis();
   {
@@ -1699,9 +1612,7 @@ static bool acceptTciPeer(const uint8_t srcMac[6]) {
     } else {
       accepted = true;
     }
-    if (STRICT_C3_PEER_LOCK && accepted) {
-      g_c3MacLocked = true;
-    }
+    if (STRICT_C3_PEER_LOCK && accepted) g_c3MacLocked = true;
   } else {
     accepted = (memcmp(activeC3PeerMac, srcMac, 6) == 0);
   }
@@ -1765,22 +1676,17 @@ static void initTciEspNowOnce() {
     addEspNowPeer(savedMac);
   }
 
-  if (basePeerOk) {
-    g_tciEspNowReady.store(true, std::memory_order_release);
-  } else {
-    esp_now_deinit();
-  }
+  if (basePeerOk) g_tciEspNowReady.store(true, std::memory_order_release);
+  else            esp_now_deinit();
 }
 
 static void syncTelemetryGate(PageId page) {
   const bool onTciPage = (page == PAGE_TCI);
-
   if (!onTciPage) {
     CritSection cs(g_stateMux);
     g_pendingModeChange = false;
     g_newPeerPending    = false;
   }
-
   g_tciRxEnabled.store(isRelayAuthorizedAtomic(), std::memory_order_release);
   g_allowChronosNotif.store(!onTciPage, std::memory_order_release);
 }
@@ -1801,9 +1707,9 @@ static void syncRtcFromChronos() {
   wasChronosConnected = true;
 
   const int year   = watch.getYear();
-  const int month  = watch.getMonth() + 1; // ESP32Time/Chronos getMonth() = 0..11 -> 1..12
+  const int month  = watch.getMonth() + 1;
   const int day    = watch.getDay();
-  const int hour   = watch.getHour(true);    // Format 24 jam (0..23)
+  const int hour   = watch.getHour(true);
   const int minute = watch.getMinute();
   const int second = watch.getSecond();
 
@@ -1836,9 +1742,7 @@ static void syncRtcFromChronos() {
       const ::DateTime rtcNow = rtc.now();
       if (rtcNow.year() >= 2020 && rtcNow.year() <= 2099) {
         const int32_t diffSec = static_cast<int32_t>(chronosDt.unixtime()) - static_cast<int32_t>(rtcNow.unixtime());
-        if (diffSec > 2 || diffSec < -2) {
-          needAdjust = true;
-        }
+        if (diffSec > 2 || diffSec < -2) needAdjust = true;
       } else {
         needAdjust = true;
       }
@@ -1867,13 +1771,13 @@ static constexpr NavKeywordRule makeRule(NavTurnType t, const char *const (&w)[N
   return {t, w, static_cast<uint8_t>(N)};
 }
 
-static constexpr const char *KW_ARRIVE[]      = {"arrive", "destination", "tiba", "tujuan", "sampai"};
-static constexpr const char *KW_U_TURN[]      = {"u-turn", "uturn", "u turn", "putar balik", "balik arah"};
-static constexpr const char *KW_ROUNDABOUT[]  = {"roundabout", "rotary", "bundaran"};
-static constexpr const char *KW_SLIGHT_LEFT[] = {"slight left", "keep left", "serong kiri", "ambil kiri", "tetap di kiri"};
-static constexpr const char *KW_SLIGHT_RIGHT[]= {"slight right", "keep right", "serong kanan", "ambil kanan", "tetap di kanan"};
-static constexpr const char *KW_LEFT[]        = {"left", "kiri"};
-static constexpr const char *KW_RIGHT[]       = {"right", "kanan"};
+static constexpr const char *KW_ARRIVE[]       = {"arrive", "destination", "tiba", "tujuan", "sampai"};
+static constexpr const char *KW_U_TURN[]       = {"u-turn", "uturn", "u turn", "putar balik", "balik arah"};
+static constexpr const char *KW_ROUNDABOUT[]   = {"roundabout", "rotary", "bundaran"};
+static constexpr const char *KW_SLIGHT_LEFT[]  = {"slight left", "keep left", "serong kiri", "ambil kiri", "tetap di kiri"};
+static constexpr const char *KW_SLIGHT_RIGHT[] = {"slight right", "keep right", "serong kanan", "ambil kanan", "tetap di kanan"};
+static constexpr const char *KW_LEFT[]         = {"left", "kiri"};
+static constexpr const char *KW_RIGHT[]        = {"right", "kanan"};
 
 static constexpr NavKeywordRule NAV_RULES[] = {
   makeRule(NAV_TURN_ARRIVE,       KW_ARRIVE),
@@ -1940,7 +1844,6 @@ static bool isDistanceToken(const char *s, char *outBuf, size_t outSize) {
 
 static uint32_t parseDistanceMeters(const char *distText) {
   if (!distText || distText[0] == '\0') return 999999999UL;
-  double val = 0.0;
   bool hasVal = false;
   char numBuf[16];
   size_t nIdx = 0;
@@ -1959,23 +1862,17 @@ static uint32_t parseDistanceMeters(const char *distText) {
   }
   numBuf[nIdx] = '\0';
   if (!hasVal) return 999999999UL;
-  val = atof(numBuf);
+  double val = atof(numBuf);
   if (val < 0.0) return 999999999UL;
 
   while (distText[pos] == ' ') pos++;
   bool isKm = (tolower(static_cast<unsigned char>(distText[pos])) == 'k' &&
                tolower(static_cast<unsigned char>(distText[pos + 1])) == 'm');
-  if (isKm) {
-    return static_cast<uint32_t>(val * 1000.0);
-  }
-  return static_cast<uint32_t>(val);
+  return isKm ? static_cast<uint32_t>(val * 1000.0) : static_cast<uint32_t>(val);
 }
 
 static const char* classifyProximityCue(uint32_t distMeters, NavTurnType turn) {
-  if (turn == NAV_TURN_ARRIVE) {
-    if (distMeters <= 40) return "TIBA DI TUJUAN";
-    return "MENUJU TUJUAN";
-  }
+  if (turn == NAV_TURN_ARRIVE) return (distMeters <= 40) ? "TIBA DI TUJUAN" : "MENUJU TUJUAN";
   if (distMeters <= 35)  return "BELOK SEKARANG!";
   if (distMeters <= 120) return "DEKAT (<120M) - SIAP";
   if (distMeters <= 350) return "BERSIAP BELOK";
@@ -2050,20 +1947,14 @@ static void extractSpeedInfo(const char *speedSrc, const char *titleSrc, const c
   for (int i = 0; i < 3; i++) {
     const char *c = cands[i];
     if (!c || c[0] == '\0') continue;
-
     if (findSpeedNumber(c, outBuf, outSize)) return;
-
     if (i == 0) {
       bool validNum = true;
       bool hasDigit = false;
       for (size_t k = 0; c[k] != '\0'; k++) {
         const unsigned char ch = static_cast<unsigned char>(c[k]);
-        if (isdigit(ch)) {
-          hasDigit = true;
-        } else if (ch != '.' && ch != ',') {
-          validNum = false;
-          break;
-        }
+        if (isdigit(ch)) hasDigit = true;
+        else if (ch != '.' && ch != ',') { validNum = false; break; }
       }
       if (validNum && hasDigit) {
         snprintf(outBuf, outSize, "%s KM/J", c);
@@ -2094,12 +1985,7 @@ static void updateNavFromChronos() {
     return;
   }
 
-  char dirBuf[48];
-  char titleBuf[48];
-  char distBuf[20];
-  char etaBuf[28];
-  char durBuf[22];
-  char spdRaw[20];
+  char dirBuf[48], titleBuf[48], distBuf[20], etaBuf[28], durBuf[22], spdRaw[20];
   copyCleanAscii(dirBuf,   nav.directions.c_str());
   copyCleanAscii(titleBuf, nav.title.c_str());
   copyCleanAscii(distBuf,  nav.distance.c_str());
@@ -2123,9 +2009,7 @@ static void updateNavFromChronos() {
     distSrc = parsedDist;
   }
   copyStr(nextNav.distance, distSrc);
-
-  copyStr(nextNav.roadName, (dirBuf[0] != '\0')   ? dirBuf
-                          : (titleBuf[0] != '\0') ? titleBuf : "Ikuti Rute GMaps");
+  copyStr(nextNav.roadName, (dirBuf[0] != '\0') ? dirBuf : (titleBuf[0] != '\0') ? titleBuf : "Ikuti Rute GMaps");
   copyStr(nextNav.etaInfo,      (etaBuf[0] != '\0') ? etaBuf : "--");
   copyStr(nextNav.durationInfo, (durBuf[0] != '\0') ? durBuf : "--");
   extractSpeedInfo(spdRaw, titleBuf, dirBuf, nextNav.speedInfo, sizeof(nextNav.speedInfo));
@@ -2144,18 +2028,13 @@ static void pollChronosNotification() {
   static bool wasBleConn = false;
 
   if (!watch.isConnected()) {
-    if (wasBleConn) {
-      lastSig[0] = '\0';
-      wasBleConn = false;
-    }
+    if (wasBleConn) { lastSig[0] = '\0'; wasBleConn = false; }
     return;
   }
   wasBleConn = true;
 
   const Notification n = watch.getNotificationAt(0);
-  char appBuf[24];
-  char titleBuf[32];
-  char msgBuf[104];
+  char appBuf[24], titleBuf[32], msgBuf[104];
   copyCleanAscii(appBuf,   n.app.c_str());
   copyCleanAscii(titleBuf, n.title.c_str());
   copyCleanAscii(msgBuf,   n.message.c_str(), false);
@@ -2187,7 +2066,7 @@ static void pollChronosNotification() {
 }
 
 // ============================================================================
-// TRANSISI & RENDERING UI LCD
+// UI LCD
 // ============================================================================
 enum UiTransitionMode : uint8_t {
   UI_TRANS_NONE = 0,
@@ -2229,29 +2108,19 @@ static void startComponentTransition(BootState bState, PageId page, uint8_t subP
   g_uiTrans.targetSub   = subPage;
 }
 
-static void drawAccentSweep(int y, uint16_t color, int progress0To320) {
-  if (progress0To320 <= 0) return;
-  int w = constrain(progress0To320, 0, 320);
-  lcd.fillRect(0, y, w, 2, color);
-}
-
 static void animateExitComponents(uint8_t exitPhase) {
   if (exitPhase == 0) {
     lcd.fillRect(0, 0, 320, 85, TFT_BLACK);
-    drawAccentSweep(85, TFT_CYAN, 200);
+    lcd.fillRect(0, 85, 200, 2, TFT_CYAN);
   } else {
     lcd.fillRect(0, 85, 320, 85, TFT_BLACK);
   }
 }
 
 static void animateEnterComponentStage(uint8_t enterStage) {
-  if (enterStage == 0) {
-    lcd.drawFastHLine(0, 24, 320, TFT_CYAN);
-  } else if (enterStage == 1) {
-    lcd.drawFastHLine(8, 86, 304, COL_FRAME);
-  } else {
-    lcd.drawFastHLine(0, 152, 320, TFT_DARKGREY);
-  }
+  if (enterStage == 0) lcd.drawFastHLine(0, 24, 320, TFT_CYAN);
+  else if (enterStage == 1) lcd.drawFastHLine(8, 86, 304, COL_FRAME);
+  else lcd.drawFastHLine(0, 152, 320, TFT_DARKGREY);
 }
 
 static void drawTopBar(const char* title, bool relayOn, bool emgBypass = false) {
@@ -2285,7 +2154,6 @@ static void drawHomeTopBarWithTicker(bool baseRedraw, bool relayOn, bool emgBypa
   if (baseRedraw) {
     lcd.fillRect(0, 0, 320, 23, TFT_NAVY);
     lcd.drawFastHLine(0, 23, 320, TFT_CYAN);
-
     lcd.setTextColor(TFT_WHITE, TFT_NAVY);
     lcd.setTextSize(2);
     lcd.setCursor(6, 4);
@@ -2309,10 +2177,7 @@ static void drawHomeTopBarWithTicker(bool baseRedraw, bool relayOn, bool emgBypa
   if (srcLen <= 0) {
     memset(winBuf, ' ', winChars);
   } else {
-    for (int i = 0; i < winChars; i++) {
-      int idx = (tickerOffset + i) % srcLen;
-      winBuf[i] = tickerText[idx];
-    }
+    for (int i = 0; i < winChars; i++) winBuf[i] = tickerText[(tickerOffset + i) % srcLen];
   }
   winBuf[winChars] = '\0';
 
@@ -2337,10 +2202,7 @@ static void drawTciPopup(const char* line1, const char* line2, uint16_t bgColor)
 static void drawNotifPopup(const NotifPopupData &n) {
   GfxBatch batch;
   const int boxX = 12, boxY = 26, boxW = 296, boxH = 138;
-  uint16_t hdrCol = TFT_NAVY;
-  if (containsIgnoreCase(n.app, "wa")) {
-    hdrCol = TFT_DARKGREEN;
-  }
+  const uint16_t hdrCol = containsIgnoreCase(n.app, "wa") ? TFT_DARKGREEN : TFT_NAVY;
 
   lcd.fillRoundRect(boxX, boxY, boxW, boxH, 6, TFT_BLACK);
   lcd.drawRoundRect(boxX, boxY, boxW, boxH, 6, TFT_CYAN);
@@ -2367,9 +2229,7 @@ static void drawNotifPopup(const NotifPopupData &n) {
   int pos = 0;
 
   for (int row = 0; row < 3; row++) {
-    while (pos < msgLen && (n.message[pos] == ' ' || n.message[pos] == '\r' || n.message[pos] == '\n')) {
-      pos++;
-    }
+    while (pos < msgLen && (n.message[pos] == ' ' || n.message[pos] == '\r' || n.message[pos] == '\n')) pos++;
 
     char line[23];
     memset(line, ' ', 22);
@@ -2396,10 +2256,7 @@ static void drawNotifPopup(const NotifPopupData &n) {
       if (pos < msgLen && (n.message[pos] == '\r' || n.message[pos] == '\n')) pos++;
     }
 
-    for (int k = lineChars; k < 22; k++) {
-      line[k] = ' ';
-    }
-
+    for (int k = lineChars; k < 22; k++) line[k] = ' ';
     lcd.setCursor(boxX + 8, boxY + 54 + (row * 25));
     lcd.print(line);
   }
@@ -2407,9 +2264,7 @@ static void drawNotifPopup(const NotifPopupData &n) {
 
 static void renderBootLockScreen(bool fullClear, bool emgBypass, bool r503Ok, uint8_t lastR503Err, bool rtcOk, bool rtcLostPower, uint8_t enterStage = 255) {
   GfxBatch batch;
-  if (fullClear) {
-    lcd.fillScreen(TFT_BLACK);
-  }
+  if (fullClear) lcd.fillScreen(TFT_BLACK);
 
   if (fullClear || enterStage == 0 || enterStage == 255) {
     lcd.drawRoundRect(4, 3, 312, 164, 6, TFT_CYAN);
@@ -2433,23 +2288,15 @@ static void renderBootLockScreen(bool fullClear, bool emgBypass, bool r503Ok, ui
     lcd.setTextSize(1);
     lcd.setTextColor(r503Ok ? TFT_GREEN : TFT_RED, TFT_BLACK);
     lcd.setCursor(16, 92);
-    if (r503Ok) {
-      lcd.print("Status R503: TERHUBUNG            ");
-    } else {
-      lcd.printf("Status R503: ERR (0x%02X) CEK UART  ", lastR503Err);
-    }
+    if (r503Ok) lcd.print("Status R503: TERHUBUNG            ");
+    else        lcd.printf("Status R503: ERR (0x%02X) CEK UART  ", lastR503Err);
 
     lcd.setTextColor(rtcOk ? (rtcLostPower ? TFT_YELLOW : TFT_GREEN) : TFT_RED, TFT_BLACK);
     lcd.setCursor(16, 108);
-    if (!rtcOk) {
-      lcd.print("Status RTC : TIDAK TERDETEKSI     ");
-    } else if (rtcLostPower) {
-      lcd.print("Status RTC : OK (BATERAI LEMAH)   ");
-    } else {
-      lcd.print("Status RTC : TERHUBUNG            ");
-    }
+    if (!rtcOk)         lcd.print("Status RTC : TIDAK TERDETEKSI     ");
+    else if (rtcLostPower) lcd.print("Status RTC : OK (BATERAI LEMAH)   ");
+    else                lcd.print("Status RTC : TERHUBUNG            ");
 
-    lcd.setTextSize(1);
     lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
     lcd.setCursor(16, 128);
     lcd.print("Emergency (GPIO2): Tahan 3.5s ON Relay");
@@ -2478,13 +2325,10 @@ static void renderPageHome(
   uint8_t enterStage = 255
 ) {
   GfxBatch batch;
-  if (fullClear) {
-    lcd.fillScreen(TFT_BLACK);
-  }
+  if (fullClear) lcd.fillScreen(TFT_BLACK);
 
   char tickerText[96];
   buildTickerText(tickerText, sizeof(tickerText), dBuf, rtcOk, rtcLostPower, fBuf);
-
   drawHomeTopBarWithTicker(fullClear || enterStage == 0 || enterStage == 255, relayOn, emgBypass, tickerText, tickerOffset);
 
   if (fullClear || enterStage == 0 || enterStage == 255) {
@@ -2495,8 +2339,6 @@ static void renderPageHome(
     lcd.print("JAM");
 
     lcd.drawRoundRect(180, 28, 134, 96, 6, COL_FRAME);
-    lcd.setTextSize(1);
-    lcd.setTextColor(TFT_SILVER, TFT_BLACK);
     lcd.setCursor(188, 34);
     lcd.print("AKI / VOLT");
   }
@@ -2504,7 +2346,6 @@ static void renderPageHome(
   if (fullClear || enterStage == 0 || enterStage == 1 || enterStage == 255) {
     char hhmm[6];
     copyStr(hhmm, tBuf);
-
     lcd.setTextSize(4);
     lcd.setTextColor(TFT_CYAN, TFT_BLACK);
     lcd.setCursor(14, 56);
@@ -2599,9 +2440,7 @@ static void drawNavTurnIcon(int cx, int cy, NavTurnType turn, uint16_t col) {
 
 static void renderPageNav(bool fullClear, bool relayOn, bool emgBypass, const NavTelemetryData &nav, bool navOnline, uint8_t enterStage = 255) {
   GfxBatch batch;
-  if (fullClear) {
-    lcd.fillScreen(TFT_BLACK);
-  }
+  if (fullClear) lcd.fillScreen(TFT_BLACK);
 
   if (fullClear || enterStage == 0 || enterStage == 255) {
     drawTopBar("2. NAVIGASI", relayOn, emgBypass);
@@ -2619,15 +2458,13 @@ static void renderPageNav(bool fullClear, bool relayOn, bool emgBypass, const Na
       lcd.print("BLE: MENUNGGU APP CHRONOS  ");
     }
 
-    uint16_t turnCol = navOnline ? TFT_CYAN : TFT_DARKGREY;
-    drawNavTurnIcon(36, 54, navOnline ? nav.turn : NAV_TURN_NONE, turnCol);
+    drawNavTurnIcon(36, 54, navOnline ? nav.turn : NAV_TURN_NONE, navOnline ? TFT_CYAN : TFT_DARKGREY);
 
     lcd.setTextSize(2);
     lcd.setTextColor(navOnline ? TFT_WHITE : TFT_SILVER, TFT_BLACK);
     lcd.setCursor(70, 38);
     lcd.printf("%-13s", navOnline ? nav.turnLabel : "NO NAV");
 
-    lcd.setTextSize(2);
     lcd.setTextColor(navOnline ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
     lcd.setCursor(70, 60);
     lcd.printf("%-12s", navOnline ? nav.distance : "--");
@@ -2707,12 +2544,8 @@ static void renderPageNav(bool fullClear, bool relayOn, bool emgBypass, const Na
 
 static void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass, const TelemetryData &d, bool online, uint8_t enterStage = 255) {
   GfxBatch batch;
-  if (fullClear) {
-    lcd.fillScreen(TFT_BLACK);
-  }
-  if (fullClear || enterStage == 0 || enterStage == 255) {
-    drawTopBar("3. TCI DASHBOARD", relayOn, emgBypass);
-  }
+  if (fullClear) lcd.fillScreen(TFT_BLACK);
+  if (fullClear || enterStage == 0 || enterStage == 255) drawTopBar("3. TCI DASHBOARD", relayOn, emgBypass);
 
   if (!online) {
     if (fullClear || enterStage >= 1 || enterStage == 255) {
@@ -2756,12 +2589,8 @@ static void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass,
                    0, static_cast<int>(MAX_RPM_SCALE), 0, 298);
     lcd.drawRect(10, 75, 300, 12, TFT_DARKGREY);
     uint16_t barCol = (d.rpm > RPM_WARN_RED) ? TFT_RED : ((d.rpm > RPM_WARN_YELLOW) ? TFT_YELLOW : TFT_GREEN);
-    if (barW > 0) {
-      lcd.fillRect(11, 76, barW, 10, barCol);
-    }
-    if (barW < 298) {
-      lcd.fillRect(11 + barW, 76, 298 - barW, 10, TFT_BLACK);
-    }
+    if (barW > 0) lcd.fillRect(11, 76, barW, 10, barCol);
+    if (barW < 298) lcd.fillRect(11 + barW, 76, 298 - barW, 10, TFT_BLACK);
   }
 
   if (fullClear || enterStage == 1 || enterStage == 255) {
@@ -2808,12 +2637,8 @@ static void renderPageTciDashboard(bool fullClear, bool relayOn, bool emgBypass,
 
 static void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, const TelemetryData &d, const uint8_t *hist, int histIdx, bool online, uint8_t enterStage = 255) {
   GfxBatch batch;
-  if (fullClear) {
-    lcd.fillScreen(TFT_BLACK);
-  }
-  if (fullClear || enterStage == 0 || enterStage == 255) {
-    drawTopBar("3. ADV CURVE", relayOn, emgBypass);
-  }
+  if (fullClear) lcd.fillScreen(TFT_BLACK);
+  if (fullClear || enterStage == 0 || enterStage == 255) drawTopBar("3. ADV CURVE", relayOn, emgBypass);
 
   constexpr int plotX = 10;
   constexpr int plotY = 28;
@@ -2839,11 +2664,8 @@ static void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, con
     int prevY = baseY;
     for (int x = 0; x < ADV_HIST_LEN - 2; x++) {
       int idx = (histIdx + x) % ADV_HIST_LEN;
-      int scaledY = map(hist[idx], 0, 60, 0, plotH - 6);
-      int curY = baseY - scaledY;
-      if (x > 0) {
-        lcd.drawLine(prevX, prevY, plotX + 1 + x, curY, TFT_GREEN);
-      }
+      int curY = baseY - map(hist[idx], 0, 60, 0, plotH - 6);
+      if (x > 0) lcd.drawLine(prevX, prevY, plotX + 1 + x, curY, TFT_GREEN);
       prevX = plotX + 1 + x;
       prevY = curY;
     }
@@ -2885,7 +2707,7 @@ static void checkStackWatermark(const char *taskName, unsigned long nowMs, unsig
   lastCheckMs = nowMs;
   const UBaseType_t highWater = uxTaskGetStackHighWaterMark(nullptr);
   if (highWater < STACK_WARN_WORDS) {
-    Serial.printf("[WARN] %s stack low: %u words\n", taskName, static_cast<unsigned int>(highWater));
+    Serial.printf("[WARN] %s stack:%u\n", taskName, static_cast<unsigned int>(highWater));
   }
 }
 
@@ -2906,9 +2728,6 @@ struct DebouncedButton {
   void reset() { lastReading = HIGH; stableState = HIGH; }
 };
 
-// ============================================================================
-// TASK IMMOBILIZER (CORE 1, PRIORITAS 4)
-// ============================================================================
 static void taskImmobilizerCore1(void* pvParameters) {
   (void)pvParameters;
   esp_task_wdt_add(nullptr);
@@ -2974,9 +2793,7 @@ static void taskImmobilizerCore1(void* pvParameters) {
 
     serviceEnrollCommandsOnCore1(nowMs);
 
-    if (g_enrollCtx.state != ENROLL_IDLE) {
-      stepEnrollSession(nowMs);
-    }
+    if (g_enrollCtx.state != ENROLL_IDLE) stepEnrollSession(nowMs);
 
     if (emBtn.update(digitalRead(PIN_BTN_EMRG), nowMs)) {
       emPressed   = (emBtn.stableState == LOW);
@@ -2986,9 +2803,7 @@ static void taskImmobilizerCore1(void* pvParameters) {
 
     if (emPressed && !emTriggered && ((nowMs - emStart) >= EMERGENCY_HOLD_MS)) {
       emTriggered = true;
-      if (g_enrollCtx.state != ENROLL_IDLE) {
-        abortEnrollSession("DIBATALKAN (EMG)", nowMs);
-      }
+      if (g_enrollCtx.state != ENROLL_IDLE) abortEnrollSession("BATAL (EMG)", nowMs);
 
       bool newEmg;
       bool stillUnlocked;
@@ -3026,8 +2841,7 @@ static void taskImmobilizerCore1(void* pvParameters) {
       postCore0(CMD_SAVE_EMG_STATE, PAGE_HOME, PAGE_HOME, newEmg);
     }
 
-    if (!isSystemUnlockedAtomic() &&
-        g_watchOneShotMatched.exchange(false, std::memory_order_acq_rel)) {
+    if (!isSystemUnlockedAtomic() && g_watchOneShotMatched.exchange(false, std::memory_order_acq_rel)) {
       char stBuf[32];
       snprintf(stBuf, sizeof(stBuf), "GW4 (%ddBm)", g_watchMatchedRssi.load(std::memory_order_acquire));
       unlockSystem(stBuf, nowMs);
@@ -3035,8 +2849,7 @@ static void taskImmobilizerCore1(void* pvParameters) {
     }
 
     bool inCooldown = g_fingerCooldownActive.load(std::memory_order_acquire);
-    if (inCooldown &&
-        (nowMs - g_fingerCooldownStartMs.load(std::memory_order_acquire)) >= FINGER_FAIL_COOLDOWN_MS) {
+    if (inCooldown && (nowMs - g_fingerCooldownStartMs.load(std::memory_order_acquire)) >= FINGER_FAIL_COOLDOWN_MS) {
       g_fingerCooldownActive.store(false, std::memory_order_release);
       inCooldown = false;
     }
@@ -3075,9 +2888,7 @@ static void taskImmobilizerCore1(void* pvParameters) {
             pendingClicks++;
             lastClickRelMs = nowMs;
           }
-          if (isSeatRelayActiveAtomic()) {
-            setSeatRelayHold(false, nowMs);
-          }
+          if (isSeatRelayActiveAtomic()) setSeatRelayHold(false, nowMs);
           isPressed     = false;
           longPressSent = false;
         }
@@ -3086,17 +2897,13 @@ static void taskImmobilizerCore1(void* pvParameters) {
       if (isPressed && !longPressSent && ((nowMs - pressStartMs) >= LONG_PRESS_MS)) {
         longPressSent = true;
         pendingClicks = 0;
-        if (getCurrentPageAtomic() == PAGE_TCI) {
-          postCore0(CMD_TCI_NEXT_MODE, PAGE_TCI, PAGE_TCI);
-        } else {
-          setSeatRelayHold(true, nowMs);
-        }
+        if (getCurrentPageAtomic() == PAGE_TCI) postCore0(CMD_TCI_NEXT_MODE, PAGE_TCI, PAGE_TCI);
+        else                                     setSeatRelayHold(true, nowMs);
       }
 
       if (pendingClicks > 0 && !isPressed && ((nowMs - lastClickRelMs) >= DOUBLE_TAP_MS)) {
         const uint8_t clicks = pendingClicks;
         pendingClicks = 0;
-
         const PageId prevPage = getCurrentPageAtomic();
         const bool   curUnl   = isSystemUnlockedAtomic();
 
@@ -3104,9 +2911,7 @@ static void taskImmobilizerCore1(void* pvParameters) {
           if (prevPage == PAGE_TCI) {
             goToPage(prevPage, PAGE_HOME, curUnl);
           } else if (prevPage == PAGE_HOME && curUnl) {
-            if (g_enrollCtx.state != ENROLL_IDLE) {
-              abortEnrollSession("DIBATALKAN (LOCK)", nowMs);
-            }
+            if (g_enrollCtx.state != ENROLL_IDLE) abortEnrollSession("BATAL (LOCK)", nowMs);
             {
               CritSection cs(g_stateMux);
               g_systemUnlocked  = false;
@@ -3138,9 +2943,6 @@ static void taskImmobilizerCore1(void* pvParameters) {
   }
 }
 
-// ============================================================================
-// TASK KOMUNIKASI PROTOKOL & WEB ENROLL (CORE 0, PRIORITAS 3)
-// ============================================================================
 static const char *const MODE_NAMES[4] = {"DAILY", "RACING", "EXTREME", "CUSTOM"};
 
 static void triggerModePopup(const char *title, uint8_t mode, uint16_t color, uint16_t durationMs) {
@@ -3175,7 +2977,7 @@ static void handleCore0Command(const Core0Command &cmd, unsigned long nowMs) {
         memcpy(activeC3PeerMac, DEFAULT_C3_MAC, 6);
         g_c3MacLocked = false;
       }
-      triggerPopup("MAC C3 RESET", "SIAP PAIRING BARU", TFT_CYAN, 1800);
+      triggerPopup("MAC C3 RESET", "PAIRING BARU", TFT_CYAN, 1800);
       break;
 
     case CMD_PAGE_CHANGED:
@@ -3270,9 +3072,9 @@ static void servicePendingModeChange(unsigned long nowMs) {
     clearPending();
     triggerModePopup("MODE AKTIF:", desiredMode, TFT_GREEN, 1600);
   } else if (sendCbSeen && !lastSendOk) {
-    retryOrGiveUp(true, "GAGAL KIRIM", "C3 TIDAK MERESPON");
+    retryOrGiveUp(true, "GAGAL KIRIM", "C3 OFFLINE");
   } else if ((nowMs - lastSendMs) >= MODE_RETRY_INT_MS) {
-    retryOrGiveUp(false, "GAGAL MODE", "TIMEOUT ACK ECU");
+    retryOrGiveUp(false, "GAGAL MODE", "TMO ACK ECU");
   }
 }
 
@@ -3324,7 +3126,7 @@ static void taskCommCore0(void* pvParameters) {
       const uint32_t macD = g_diagMacDrop.load(std::memory_order_relaxed);
       const uint32_t txF  = g_diagTxFail.load(std::memory_order_relaxed);
       if (crcE > 0 || macD > 0 || txF > 0) {
-        Serial.printf("[DIAG] CRC_ERR=%lu MAC_DROP=%lu TX_FAIL=%lu\n",
+        Serial.printf("[DIAG] CRC:%lu MAC:%lu TX:%lu\n",
                       static_cast<unsigned long>(crcE),
                       static_cast<unsigned long>(macD),
                       static_cast<unsigned long>(txF));
@@ -3337,14 +3139,10 @@ static void taskCommCore0(void* pvParameters) {
     }
 
     servicePendingModeChange(nowMs);
-
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
-// ============================================================================
-// TASK RENDERING LCD & RTC (CORE 0, PRIORITAS 2)
-// ============================================================================
 static constexpr unsigned long UI_FRAME_MS      = 16;
 static constexpr unsigned long UI_TRANS_TICK_MS = 8;
 
@@ -3506,10 +3304,10 @@ static void taskDisplayLcdCore0(void* pvParameters) {
       forceFullRedrawNext = true;
     }
 
-    const bool    rtcOk    = g_rtcOk.load(std::memory_order_acquire);
-    const bool    rtcLp    = g_rtcLostPower.load(std::memory_order_acquire);
-    const bool    r503Ok   = g_r503Ok.load(std::memory_order_acquire);
-    const uint8_t r503Err  = g_lastR503Err.load(std::memory_order_acquire);
+    const bool    rtcOk   = g_rtcOk.load(std::memory_order_acquire);
+    const bool    rtcLp   = g_rtcLostPower.load(std::memory_order_acquire);
+    const bool    r503Ok  = g_r503Ok.load(std::memory_order_acquire);
+    const uint8_t r503Err = g_lastR503Err.load(std::memory_order_acquire);
 
     auto commitCommon = [&](bool online) {
       lastRenderedBoot   = curBoot;
@@ -3550,11 +3348,8 @@ static void taskDisplayLcdCore0(void* pvParameters) {
         const NavTelemetryData navSnap = snapshotNav(nowMs, navOnline);
         renderPageNav(false, relayOn, curEmg, navSnap, navOnline, stage);
       } else if (curPage == PAGE_TCI) {
-        if (curSub == 0) {
-          renderPageTciDashboard(false, relayOn, curEmg, tciSnap, tciOnline, stage);
-        } else {
-          renderPageTciCurve(false, relayOn, curEmg, tciSnap, tciHistCopy, tciHistIdx, tciOnline, stage);
-        }
+        if (curSub == 0) renderPageTciDashboard(false, relayOn, curEmg, tciSnap, tciOnline, stage);
+        else             renderPageTciCurve(false, relayOn, curEmg, tciSnap, tciHistCopy, tciHistIdx, tciOnline, stage);
       }
 
       g_uiTrans.step++;
@@ -3662,7 +3457,6 @@ void setup() {
   g_enrollCmdQueue = xQueueCreate(8, sizeof(EnrollCommand));
 
   if (!g_i2cMutex || !g_nvsMutex || !g_r503Mutex || !g_core0CmdQueue || !g_espNowRxQueue || !g_enrollCmdQueue) {
-    Serial.println("[FATAL] Alokasi RTOS gagal!");
     delay(1000);
     ESP.restart();
   }
@@ -3687,9 +3481,7 @@ void setup() {
     ScopedLock lock(g_i2cMutex, 200);
     if (lock && rtc.begin(&Wire)) {
       g_rtcOk.store(true, std::memory_order_release);
-      if (rtc.lostPower()) {
-        g_rtcLostPower.store(true, std::memory_order_release);
-      }
+      if (rtc.lostPower()) g_rtcLostPower.store(true, std::memory_order_release);
     }
   }
   updateRtcCache();
@@ -3709,9 +3501,7 @@ void setup() {
         }
       }
       g_r503Ok.store(r503Ready, std::memory_order_release);
-      if (!r503Ready) {
-        g_lastR503Err.store(FINGERPRINT_PACKETRECIEVEERR, std::memory_order_release);
-      }
+      if (!r503Ready) g_lastR503Err.store(FINGERPRINT_PACKETRECIEVEERR, std::memory_order_release);
     }
   }
 
