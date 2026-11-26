@@ -3,7 +3,6 @@
 #include <RTClib.h>
 #include <Adafruit_Fingerprint.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_task_wdt.h>
@@ -52,7 +51,7 @@ constexpr uint8_t  LCD_BL_DUTY_NIGHT = 115;
 constexpr uint16_t COL_FRAME         = 0x2104;
 
 // ============================================================================
-// KONFIGURASI PROTOKOL, SMARTWATCH, WEB ENROLL & AMBANG BATAS
+// KONFIGURASI PROTOKOL, SMARTWATCH & AMBANG BATAS
 // ============================================================================
 constexpr uint8_t TCI_WIFI_CHANNEL = 1;
 static const uint8_t HUD_S3_CUSTOM_MAC[6] = {0x02, 0x53, 0x46, 0x55, 0x48, 0x55};
@@ -62,10 +61,6 @@ static constexpr char TARGET_WATCH_NAME[]   = "Galaxy Watch4 (3M7H)";
 static constexpr int  WATCH_UNLOCK_RSSI_MIN = -75;
 static constexpr unsigned long WATCH_SCAN_INTERVAL_MS = 1500;
 static constexpr unsigned long WATCH_SCAN_WINDOW_MS   = 80;
-
-static constexpr char WEB_AP_SSID[] = "Satria-HUD-R503";
-static constexpr char WEB_AP_PASS[] = "satria1234";
-static constexpr unsigned long WEB_BOOT_WINDOW_MS = 30000;
 
 constexpr bool STRICT_C3_PEER_LOCK     = true;
 constexpr bool ALLOW_INITIAL_C3_LEARN  = true;
@@ -96,6 +91,7 @@ constexpr unsigned long DEBOUNCE_MS        = 50;
 constexpr unsigned long LONG_PRESS_MS      = 3000;
 constexpr unsigned long SEAT_MAX_HOLD_MS   = 8000;
 constexpr unsigned long EMERGENCY_HOLD_MS  = 3500;
+constexpr unsigned long ENROLL_BTN_HOLD_MS = 3000;
 constexpr unsigned long DOUBLE_TAP_MS      = 300;
 constexpr unsigned long TCI_TIMEOUT_MS     = 1500;
 constexpr unsigned long NAV_TIMEOUT_MS     = 10000;
@@ -109,9 +105,6 @@ constexpr uint32_t WDT_TIMEOUT_SEC     = 5;
 constexpr uint32_t I2C_CLOCK_HZ        = 100000;
 constexpr uint8_t  MODE_SEND_MAX_RETRY = 5;
 
-constexpr unsigned long STACK_CHECK_MS   = 60000;
-constexpr UBaseType_t   STACK_WARN_WORDS = 512;
-constexpr unsigned long DIAG_LOG_MS      = 30000;
 constexpr unsigned long RTC_READ_MS      = 500;
 constexpr unsigned long FINGER_POLL_MS   = 120;
 constexpr unsigned long TICKER_STEP_MS   = 95;
@@ -194,10 +187,6 @@ static std::atomic<bool>          g_fingerCooldownActive{false};
 static std::atomic<unsigned long> g_fingerCooldownStartMs{0};
 
 static ChronosESP32 watch(BLE_DEVICE_NAME);
-static WebServer g_webServer(80);
-static std::atomic<bool> g_webServerActive{false};
-static std::atomic<bool> g_webServerExpired{false};
-static unsigned long g_webBootStartMs = 0;
 
 static std::atomic<bool>          g_watchOneShotMatched{false};
 static std::atomic<bool>          g_watchScanFinished{false};
@@ -313,7 +302,7 @@ static portMUX_TYPE g_notifMux = portMUX_INITIALIZER_UNLOCKED;
 static NotifPopupData g_notifPopup = {false, "", "", "", 0, NOTIF_POPUP_MS, 0};
 
 // ============================================================================
-// STATE SISTEM, ENROLL WEB & RTOS
+// STATE SISTEM & RTOS
 // ============================================================================
 enum BootState : uint8_t {
   BOOT_WAIT_FINGERPRINT = 0,
@@ -342,34 +331,6 @@ struct Core0Command {
   bool         flagVal;
 };
 
-enum EnrollCmdType : uint8_t {
-  ENROLL_CMD_ADD = 1,
-  ENROLL_CMD_SAVE,
-  ENROLL_CMD_DELETE,
-  ENROLL_CMD_ABORT
-};
-
-struct EnrollCommand {
-  EnrollCmdType type;
-  uint16_t      slotId;
-};
-
-enum WebEnrollStage : uint8_t {
-  WEB_ENROLL_IDLE = 0,
-  WEB_ENROLL_FIND_SLOT,
-  WEB_ENROLL_WAIT_FINGER_1,
-  WEB_ENROLL_WAIT_LIFT,
-  WEB_ENROLL_WAIT_FINGER_2,
-  WEB_ENROLL_READY_TO_SAVE,
-  WEB_ENROLL_SAVED,
-  WEB_ENROLL_ERROR
-};
-
-static portMUX_TYPE g_webEnrollMux = portMUX_INITIALIZER_UNLOCKED;
-static WebEnrollStage g_webEnrollStage = WEB_ENROLL_IDLE;
-static uint16_t g_webTargetSlot = 0;
-static char g_webEnrollMsg[56] = "Web aktif 30 detik saat boot";
-
 static BootState     g_bootState       = BOOT_WAIT_FINGERPRINT;
 static PageId        g_currentPage     = PAGE_HOME;
 static bool          g_systemUnlocked  = false;
@@ -382,10 +343,6 @@ static std::atomic<bool> g_tciEspNowReady{false};
 static std::atomic<bool> g_tciRxEnabled{false};
 static std::atomic<bool> g_allowChronosNotif{true};
 static std::atomic<bool> g_watchStopPending{false};
-
-static std::atomic<uint32_t> g_diagCrcErr{0};
-static std::atomic<uint32_t> g_diagMacDrop{0};
-static std::atomic<uint32_t> g_diagTxFail{0};
 
 static SemaphoreHandle_t g_i2cMutex  = nullptr;
 static SemaphoreHandle_t g_nvsMutex  = nullptr;
@@ -426,9 +383,8 @@ static volatile bool    g_c3MacLocked       = false;
 static volatile bool    g_newPeerPending    = false;
 static uint8_t          g_pendingPeerMac[6] = {0};
 
-static QueueHandle_t g_core0CmdQueue  = nullptr;
-static QueueHandle_t g_espNowRxQueue  = nullptr;
-static QueueHandle_t g_enrollCmdQueue = nullptr;
+static QueueHandle_t g_core0CmdQueue = nullptr;
+static QueueHandle_t g_espNowRxQueue = nullptr;
 
 // ============================================================================
 // UTILITAS & LOCK
@@ -599,24 +555,6 @@ static void sanitizeAsciiInPlace(char *s, bool replaceNewlineWithSpace = true) {
     else s[w++] = '?';
   }
   s[w] = '\0';
-}
-
-static void formatJsonEscaped(const char *src, char *dst, size_t dstSize) {
-  if (!dst || dstSize == 0) return;
-  if (!src) { dst[0] = '\0'; return; }
-  size_t w = 0;
-  for (size_t r = 0; src[r] != '\0' && w + 2 < dstSize; r++) {
-    unsigned char ch = static_cast<unsigned char>(src[r]);
-    if (ch == '"' || ch == '\\') {
-      dst[w++] = '\\';
-      dst[w++] = static_cast<char>(ch);
-    } else if (ch == '\n') {
-      dst[w++] = ' ';
-    } else if (ch >= 0x20 && ch <= 0x7E) {
-      dst[w++] = static_cast<char>(ch);
-    }
-  }
-  dst[w] = '\0';
 }
 
 static void trimAsciiInPlace(char *s) {
@@ -793,8 +731,6 @@ static void pollWatchOneShotScan(unsigned long nowMs) {
     return;
   }
 
-  if (g_webServerActive.load(std::memory_order_acquire)) return;
-
   if (g_pWatchScan == nullptr) {
     g_pWatchScan = NimBLEDevice::getScan();
     if (g_pWatchScan) {
@@ -873,7 +809,7 @@ static void updateRtcCache() {
 
   CritSection cs(g_stateMux);
   memcpy(g_timeStr, tBuf, sizeof(g_timeStr));
-  memcpy(g_dateStr, dBuf, sizeof(g_dateStr));
+  memcpy(g_dateStr, dBuf, sizeof(dBuf));
   g_chipTempC = chipC;
   g_rtcSeq++;
 }
@@ -995,29 +931,11 @@ static void serviceLedAndBuzzer(bool systemUnlockedOrEmg, unsigned long nowMs = 
 }
 
 // ============================================================================
-// SENSOR SIDIK JARI R503 & ENROLL (CORE 1)
+// SENSOR SIDIK JARI R503 & ENROLL TOMBOL FISIK (CORE 1)
 // ============================================================================
 static void applyR503DefaultConfig() {
   finger.setSecurityLevel(2);
   finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE, 0);
-}
-
-static void setWebEnrollState(WebEnrollStage st, uint16_t slot, const char* msg) {
-  CritSection cs(g_webEnrollMux);
-  g_webEnrollStage = st;
-  g_webTargetSlot  = slot;
-  copyStr(g_webEnrollMsg, msg);
-}
-
-static void setEnrollStatus(WebEnrollStage st, uint16_t slot, const char *webMsg, const char *lcdMsg, bool fullClear = false) {
-  setWebEnrollState(st, slot, webMsg);
-  setFingerStatus(lcdMsg, fullClear);
-}
-
-static bool enqueueEnrollCommand(EnrollCmdType type, uint16_t slotId = 0) {
-  if (g_enrollCmdQueue == nullptr) return false;
-  EnrollCommand cmd{type, slotId};
-  return (xQueueSend(g_enrollCmdQueue, &cmd, pdMS_TO_TICKS(20)) == pdTRUE);
 }
 
 static int scanFingerprintOnce(uint16_t &outId, int &outConfidence) {
@@ -1091,7 +1009,6 @@ static void abortEnrollSession(const char *reasonMsg, unsigned long nowMs) {
     ScopedLock lock(g_r503Mutex, 50);
     if (lock) finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE, 0);
   }
-  setWebEnrollState(WEB_ENROLL_ERROR, 0, reasonMsg);
   triggerLedAndBuzzer(2, 1200, BUZZ_ALERT, nowMs);
   triggerPopup("ENROLL GAGAL", reasonMsg, TFT_RED, 1800);
   setFingerStatus(reasonMsg, true);
@@ -1099,7 +1016,7 @@ static void abortEnrollSession(const char *reasonMsg, unsigned long nowMs) {
 
 static bool startEnrollSession(unsigned long nowMs) {
   if (!isSystemUnlockedAtomic()) {
-    setWebEnrollState(WEB_ENROLL_ERROR, 0, "Buka kunci HUD dulu");
+    triggerPopup("TERKUNCI", "BUKA HUD DULU", TFT_RED, 1500);
     return false;
   }
 
@@ -1128,8 +1045,8 @@ static bool startEnrollSession(unsigned long nowMs) {
   g_enrollCtx.stepStartMs     = nowMs;
   g_enrollCtx.lastSlotProbeMs = 0;
 
-  setEnrollStatus(WEB_ENROLL_FIND_SLOT, 0, "Cari slot kosong...", "CARI SLOT R503...");
-  triggerPopup("WEB ENROLL", "CARI SLOT", TFT_CYAN, 1500);
+  setFingerStatus("CARI SLOT R503...", false);
+  triggerPopup("ENROLL BARU", "CARI SLOT", TFT_CYAN, 1500);
   triggerLedAndBuzzer(1, 800, BUZZ_ENROLL_STEP, nowMs);
   return true;
 }
@@ -1170,10 +1087,10 @@ static void stepEnrollFindSlot(unsigned long nowMs) {
     g_enrollCtx.targetSlot  = freeSlot;
     g_enrollCtx.stepStartMs = nowMs;
 
-    char msg[56];
-    snprintf(msg, sizeof(msg), "Jari 1/2 (Slot #%u)", freeSlot);
-    setEnrollStatus(WEB_ENROLL_WAIT_FINGER_1, freeSlot, msg, "TEMPEL JARI 1/2");
-    triggerPopup("ENROLL 1/2", "TEMPEL JARI", TFT_YELLOW, 2200);
+    char popL2[20];
+    snprintf(popL2, sizeof(popL2), "SLOT #%u", freeSlot);
+    setFingerStatus("TEMPEL JARI 1/2", false);
+    triggerPopup("ENROLL 1/2", popL2, TFT_YELLOW, 2200);
     triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP, nowMs);
   } else if (exhausted) {
     abortEnrollSession("MEMORI PENUH", nowMs);
@@ -1198,7 +1115,7 @@ static void stepEnrollCapture(unsigned long nowMs) {
         finger.LEDcontrol(FINGERPRINT_LED_OFF, 0, 0, 0);
         lock.release();
 
-        setEnrollStatus(WEB_ENROLL_WAIT_LIFT, g_enrollCtx.targetSlot, "Angkat jari...", "ANGKAT JARI...");
+        setFingerStatus("ANGKAT JARI...", false);
         triggerLedAndBuzzer(1, 500, BUZZ_ENROLL_STEP, nowMs);
         triggerPopup("ANGKAT JARI", "TUNGGU...", TFT_CYAN, 2000);
       } else if (p != FINGERPRINT_NOFINGER) {
@@ -1215,9 +1132,7 @@ static void stepEnrollCapture(unsigned long nowMs) {
         finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 25, FINGERPRINT_LED_RED, 0);
         lock.release();
 
-        char msg[56];
-        snprintf(msg, sizeof(msg), "Jari 2/2 (Slot #%u)", g_enrollCtx.targetSlot);
-        setEnrollStatus(WEB_ENROLL_WAIT_FINGER_2, g_enrollCtx.targetSlot, msg, "TEMPEL JARI 2/2");
+        setFingerStatus("TEMPEL JARI 2/2", false);
         triggerPopup("ENROLL 2/2", "TEMPEL LAGI", TFT_YELLOW, 2200);
         triggerLedAndBuzzer(2, 1800, BUZZ_ENROLL_STEP, nowMs);
       }
@@ -1238,19 +1153,25 @@ static void stepEnrollCapture(unsigned long nowMs) {
           return;
         }
 
-        const uint16_t readySlot = g_enrollCtx.targetSlot;
+        const uint16_t savedSlot = g_enrollCtx.targetSlot;
+        const uint8_t storeRes   = finger.storeModel(savedSlot);
         g_enrollCtx.state          = ENROLL_IDLE;
         g_enrollCtx.scanSlotCursor = 1;
-        finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE, 0);
-        lock.release();
 
-        char readyMsg[56];
-        char lcdMsg[32];
-        snprintf(readyMsg, sizeof(readyMsg), "Siap simpan Slot #%u", readySlot);
-        snprintf(lcdMsg, sizeof(lcdMsg), "SIAP SIMPAN #%u", readySlot);
-        setEnrollStatus(WEB_ENROLL_READY_TO_SAVE, readySlot, readyMsg, lcdMsg, true);
-        triggerPopup("SIAP SIMPAN", lcdMsg, TFT_CYAN, 2200);
-        triggerLedAndBuzzer(1, 1000, BUZZ_ENROLL_STEP, nowMs);
+        if (storeRes == FINGERPRINT_OK) {
+          finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 10, FINGERPRINT_LED_BLUE, 3);
+          lock.release();
+
+          char okLcd[32];
+          snprintf(okLcd, sizeof(okLcd), "TERSIMPAN #%u", savedSlot);
+          setFingerStatus(okLcd, true);
+          triggerPopup("TERSIMPAN", okLcd, TFT_GREEN, 2000);
+          triggerLedAndBuzzer(1, 1500, BUZZ_ENROLL_OK, nowMs);
+        } else {
+          finger.LEDcontrol(FINGERPRINT_LED_BREATHING, 100, FINGERPRINT_LED_BLUE, 0);
+          lock.release();
+          abortEnrollSession("GAGAL SIMPAN", nowMs);
+        }
       } else if (p != FINGERPRINT_NOFINGER) {
         lock.release();
         abortEnrollSession("SCAN #2 GAGAL", nowMs);
@@ -1273,121 +1194,9 @@ static void stepEnrollSession(unsigned long nowMs) {
   else                                        stepEnrollCapture(nowMs);
 }
 
-static bool saveEnrolledFingerprintToR503(unsigned long nowMs) {
-  WebEnrollStage st;
-  uint16_t slot;
-  {
-    CritSection cs(g_webEnrollMux);
-    st   = g_webEnrollStage;
-    slot = g_webTargetSlot;
-  }
-
-  if (st != WEB_ENROLL_READY_TO_SAVE || slot == 0) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Belum siap disimpan");
-    return false;
-  }
-
-  uint8_t p;
-  {
-    ScopedLock lock(g_r503Mutex, 100);
-    if (!lock) {
-      setWebEnrollState(WEB_ENROLL_ERROR, slot, "R503 sibuk");
-      return false;
-    }
-    p = finger.storeModel(slot);
-    if (p == FINGERPRINT_OK) {
-      finger.LEDcontrol(FINGERPRINT_LED_FLASHING, 10, FINGERPRINT_LED_BLUE, 3);
-    }
-  }
-
-  if (p != FINGERPRINT_OK) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slot, "Gagal simpan R503");
-    triggerPopup("SIMPAN GAGAL", "CEK R503", TFT_RED, 1800);
-    triggerLedAndBuzzer(2, 1200, BUZZ_ALERT, nowMs);
-    return false;
-  }
-
-  char okWeb[56];
-  char okLcd[32];
-  snprintf(okWeb, sizeof(okWeb), "Tersimpan ID #%u", slot);
-  snprintf(okLcd, sizeof(okLcd), "TERSIMPAN #%u", slot);
-  setEnrollStatus(WEB_ENROLL_SAVED, slot, okWeb, okLcd, true);
-  triggerPopup("TERSIMPAN", okLcd, TFT_GREEN, 2000);
-  triggerLedAndBuzzer(1, 1500, BUZZ_ENROLL_OK, nowMs);
-  return true;
-}
-
-static bool deleteFingerprintSlotR503(uint16_t slotId, unsigned long nowMs) {
-  if (!isSystemUnlockedAtomic()) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Buka kunci HUD dulu");
-    return false;
-  }
-  if (slotId == 0 || slotId > FINGER_MAX_SLOTS) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "ID harus 1-127");
-    return false;
-  }
-
-  uint8_t p;
-  {
-    ScopedLock lock(g_r503Mutex, 100);
-    if (!lock) {
-      setWebEnrollState(WEB_ENROLL_ERROR, slotId, "R503 sibuk");
-      return false;
-    }
-    p = finger.deleteModel(slotId);
-  }
-
-  if (p != FINGERPRINT_OK) {
-    setWebEnrollState(WEB_ENROLL_ERROR, slotId, "Gagal hapus ID");
-    triggerPopup("HAPUS GAGAL", "CEK ID", TFT_RED, 1600);
-    triggerLedAndBuzzer(2, 1000, BUZZ_ALERT, nowMs);
-    return false;
-  }
-
-  char msg[56];
-  char lcdMsg[32];
-  snprintf(msg, sizeof(msg), "ID #%u dihapus", slotId);
-  snprintf(lcdMsg, sizeof(lcdMsg), "HAPUS ID #%u", slotId);
-  setWebEnrollState(WEB_ENROLL_IDLE, 0, msg);
-  triggerPopup("ID DIHAPUS", lcdMsg, TFT_CYAN, 1600);
-  triggerLedAndBuzzer(1, 800, BUZZ_ENROLL_STEP, nowMs);
-  return true;
-}
-
-static void serviceEnrollCommandsOnCore1(unsigned long nowMs) {
-  EnrollCommand cmd;
-  while (g_enrollCmdQueue && xQueueReceive(g_enrollCmdQueue, &cmd, 0) == pdTRUE) {
-    switch (cmd.type) {
-      case ENROLL_CMD_ADD:    startEnrollSession(nowMs); break;
-      case ENROLL_CMD_SAVE:   saveEnrolledFingerprintToR503(nowMs); break;
-      case ENROLL_CMD_DELETE: deleteFingerprintSlotR503(cmd.slotId, nowMs); break;
-      case ENROLL_CMD_ABORT:
-        if (g_enrollCtx.state != ENROLL_IDLE) abortEnrollSession("DIBATALKAN", nowMs);
-        break;
-    }
-  }
-}
-
 // ============================================================================
-// WEB SERVER AP (AKTIF 30 DETIK SAAT BOOT)
+// ESP-NOW TCI
 // ============================================================================
-static const char ENROLL_WEB_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>R503 HUD</title><style>body{font-family:sans-serif;background:#111;color:#eee;padding:14px;max-width:420px;margin:auto}
-button{padding:9px 12px;border:0;border-radius:6px;font-weight:bold;margin:4px 2px}
-.a{background:#22c55e;color:#000}.s{background:#3b82f6;color:#fff}.d{background:#ef4444;color:#fff}
-input{padding:8px;width:75px;border-radius:6px;border:1px solid #555;background:#222;color:#fff}</style></head>
-<body><h3>R503 Control</h3>
-<button class="a" onclick="f('/api/add')">Tambah</button>
-<button class="s" id="bs" onclick="f('/api/save')" disabled>Simpan</button>
-<div id="st" style="margin:8px 0;color:#facc15">...</div>
-<hr><input type="number" id="id" min="1" max="127" value="1">
-<button class="d" onclick="f('/api/delete','id='+encodeURIComponent(id.value))">Hapus</button>
-<script>async function f(u,b){const r=await fetch(u,{method:'POST',body:b||''});st.innerText=await r.text();p();}
-async function p(){try{const r=await fetch('/api/status');if(!r.ok)return;const j=await r.json();st.innerText=j.msg;bs.disabled=!j.canSave;}catch(e){}}
-setInterval(p,600);p();</script></body></html>
-)HTML";
-
 static void applyEspNowRadioParams(bool disconnectStaFirst) {
   if (disconnectStaFirst) WiFi.disconnect(false, false);
   esp_wifi_set_mac(WIFI_IF_STA, HUD_S3_CUSTOM_MAC);
@@ -1395,113 +1204,6 @@ static void applyEspNowRadioParams(bool disconnectStaFirst) {
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 }
 
-static void replyQueued(bool queued, const char *okMsg) {
-  g_webServer.send(queued ? 202 : 503, "text/plain", queued ? okMsg : "Antrean penuh");
-}
-
-static void rejectWebRequest(uint16_t slot, const char *msg) {
-  setWebEnrollState(WEB_ENROLL_ERROR, slot, msg);
-  g_webServer.send(400, "text/plain", msg);
-}
-
-static void startBootEnrollWebServer() {
-  if (g_webServerActive.load(std::memory_order_acquire) || g_webServerExpired.load(std::memory_order_acquire)) {
-    return;
-  }
-
-  g_webBootStartMs = millis();
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-  WiFi.softAP(WEB_AP_SSID, WEB_AP_PASS, TCI_WIFI_CHANNEL, false, 2);
-
-  g_webServer.on("/", HTTP_GET, []() {
-    g_webServer.send_P(200, "text/html", ENROLL_WEB_HTML);
-  });
-
-  g_webServer.on("/api/status", HTTP_GET, []() {
-    WebEnrollStage st;
-    uint16_t slot;
-    char msg[sizeof(g_webEnrollMsg)];
-    {
-      CritSection cs(g_webEnrollMux);
-      st   = g_webEnrollStage;
-      slot = g_webTargetSlot;
-      copyStr(msg, g_webEnrollMsg);
-    }
-
-    char safeMsg[120];
-    formatJsonEscaped(msg, safeMsg, sizeof(safeMsg));
-
-    char json[200];
-    snprintf(json, sizeof(json), "{\"stage\":%u,\"slot\":%u,\"canSave\":%s,\"msg\":\"%s\"}",
-             static_cast<unsigned int>(st),
-             static_cast<unsigned int>(slot),
-             (st == WEB_ENROLL_READY_TO_SAVE) ? "true" : "false",
-             safeMsg);
-    g_webServer.send(200, "application/json", json);
-  });
-
-  g_webServer.on("/api/add", HTTP_POST, []() {
-    if (!isSystemUnlockedAtomic()) {
-      rejectWebRequest(0, "Buka kunci HUD dulu");
-      return;
-    }
-    replyQueued(enqueueEnrollCommand(ENROLL_CMD_ADD, 0), "Tambah dikirim");
-  });
-
-  g_webServer.on("/api/save", HTTP_POST, []() {
-    replyQueued(enqueueEnrollCommand(ENROLL_CMD_SAVE, 0), "Simpan dikirim");
-  });
-
-  g_webServer.on("/api/delete", HTTP_POST, []() {
-    if (!g_webServer.hasArg("id")) {
-      g_webServer.send(400, "text/plain", "ID wajib diisi");
-      return;
-    }
-    const uint16_t slotId = static_cast<uint16_t>(g_webServer.arg("id").toInt());
-    if (!isSystemUnlockedAtomic()) {
-      rejectWebRequest(slotId, "Buka kunci HUD dulu");
-      return;
-    }
-    if (slotId == 0 || slotId > FINGER_MAX_SLOTS) {
-      rejectWebRequest(slotId, "ID 1-127");
-      return;
-    }
-    replyQueued(enqueueEnrollCommand(ENROLL_CMD_DELETE, slotId), "Hapus dikirim");
-  });
-
-  g_webServer.begin();
-  g_webServerActive.store(true, std::memory_order_release);
-}
-
-static void stopBootEnrollWebServer() {
-  if (!g_webServerActive.load(std::memory_order_acquire)) return;
-
-  g_webServer.stop();
-  WiFi.softAPdisconnect(true);
-  if (!g_tciEspNowReady.load(std::memory_order_acquire)) {
-    WiFi.mode(WIFI_OFF);
-  } else {
-    WiFi.mode(WIFI_STA);
-    applyEspNowRadioParams(false);
-  }
-
-  g_webServerActive.store(false, std::memory_order_release);
-  g_webServerExpired.store(true, std::memory_order_release);
-  setWebEnrollState(WEB_ENROLL_IDLE, 0, "Web nonaktif");
-}
-
-static void serviceBootEnrollWebServer(unsigned long nowMs) {
-  if (!g_webServerActive.load(std::memory_order_acquire)) return;
-  g_webServer.handleClient();
-  if ((nowMs - g_webBootStartMs) >= WEB_BOOT_WINDOW_MS && WiFi.softAPgetStationNum() == 0) {
-    stopBootEnrollWebServer();
-  }
-}
-
-// ============================================================================
-// ESP-NOW TCI
-// ============================================================================
 static void recordEspSendResult(bool ok) {
   CritSection cs(g_stateMux);
   g_lastEspSendOk = ok;
@@ -1543,9 +1245,7 @@ static void syncPendingEspNowPeer() {
   }
   if (!hasPending) return;
 
-  if (!esp_now_is_peer_exist(macCopy) && addEspNowPeer(macCopy) != ESP_OK) {
-    g_diagTxFail.fetch_add(1, std::memory_order_relaxed);
-  }
+  if (!esp_now_is_peer_exist(macCopy)) addEspNowPeer(macCopy);
   saveC3MacToNvs(macCopy);
 }
 
@@ -1568,8 +1268,6 @@ static bool sendModePacket(uint8_t mode) {
   }
 
   const esp_err_t res = esp_now_send(destMac, reinterpret_cast<const uint8_t*>(&cmd), sizeof(CommandData));
-  if (res != ESP_OK) g_diagTxFail.fetch_add(1, std::memory_order_relaxed);
-
   const unsigned long nowMs = millis();
   {
     CritSection cs(g_stateMux);
@@ -1629,16 +1327,8 @@ static void processIncomingEspNowFrames() {
 
     const TelemetryData *pkt = reinterpret_cast<const TelemetryData*>(frame.payload);
     if (pkt->header != 0xAA55) continue;
-
-    if (pkt->crc16 != calculateCRC16(frame.payload, sizeof(TelemetryData) - sizeof(uint16_t))) {
-      g_diagCrcErr.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-
-    if (!acceptTciPeer(frame.srcMac)) {
-      g_diagMacDrop.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
+    if (pkt->crc16 != calculateCRC16(frame.payload, sizeof(TelemetryData) - sizeof(uint16_t))) continue;
+    if (!acceptTciPeer(frame.srcMac)) continue;
 
     const int degClamped = constrain(static_cast<int>(pkt->degree10), 0, 350);
     const uint8_t mapped = static_cast<uint8_t>(map(degClamped, 0, 350, 0, 60));
@@ -1655,7 +1345,7 @@ static void processIncomingEspNowFrames() {
 static void initTciEspNowOnce() {
   if (g_tciEspNowReady.load(std::memory_order_acquire)) return;
 
-  WiFi.mode(g_webServerActive.load(std::memory_order_acquire) ? WIFI_AP_STA : WIFI_STA);
+  WiFi.mode(WIFI_STA);
   applyEspNowRadioParams(true);
 
   if (esp_now_init() != ESP_OK) return;
@@ -2293,9 +1983,9 @@ static void renderBootLockScreen(bool fullClear, bool emgBypass, bool r503Ok, ui
 
     lcd.setTextColor(rtcOk ? (rtcLostPower ? TFT_YELLOW : TFT_GREEN) : TFT_RED, TFT_BLACK);
     lcd.setCursor(16, 108);
-    if (!rtcOk)         lcd.print("Status RTC : TIDAK TERDETEKSI     ");
+    if (!rtcOk)            lcd.print("Status RTC : TIDAK TERDETEKSI     ");
     else if (rtcLostPower) lcd.print("Status RTC : OK (BATERAI LEMAH)   ");
-    else                lcd.print("Status RTC : TERHUBUNG            ");
+    else                   lcd.print("Status RTC : TERHUBUNG            ");
 
     lcd.setTextColor(TFT_ORANGE, TFT_BLACK);
     lcd.setCursor(16, 128);
@@ -2702,15 +2392,6 @@ static void renderPageTciCurve(bool fullClear, bool relayOn, bool emgBypass, con
 // ============================================================================
 // FREERTOS TASKS
 // ============================================================================
-static void checkStackWatermark(const char *taskName, unsigned long nowMs, unsigned long &lastCheckMs) {
-  if ((nowMs - lastCheckMs) < STACK_CHECK_MS) return;
-  lastCheckMs = nowMs;
-  const UBaseType_t highWater = uxTaskGetStackHighWaterMark(nullptr);
-  if (highWater < STACK_WARN_WORDS) {
-    Serial.printf("[WARN] %s stack:%u\n", taskName, static_cast<unsigned int>(highWater));
-  }
-}
-
 struct DebouncedButton {
   bool          lastReading  = HIGH;
   bool          stableState  = HIGH;
@@ -2744,8 +2425,12 @@ static void taskImmobilizerCore1(void* pvParameters) {
   bool          emTriggered = false;
   unsigned long emStart     = 0;
 
-  unsigned long lastFingerMs   = 0;
-  unsigned long lastStackChkMs = 0;
+  DebouncedButton enrBtn;
+  bool          enrPressed   = false;
+  bool          enrTriggered = false;
+  unsigned long enrStart     = 0;
+
+  unsigned long lastFingerMs = 0;
 
   auto resetMainButtonState = [&]() {
     mainBtn.reset();
@@ -2780,7 +2465,6 @@ static void taskImmobilizerCore1(void* pvParameters) {
     const unsigned long nowMs = millis();
 
     applyRelayOutput(nowMs);
-    checkStackWatermark("ImmobCore1", nowMs, lastStackChkMs);
 
     bool unlockedSnap;
     bool emgSnap;
@@ -2791,7 +2475,17 @@ static void taskImmobilizerCore1(void* pvParameters) {
     }
     serviceLedAndBuzzer(unlockedSnap || emgSnap, nowMs);
 
-    serviceEnrollCommandsOnCore1(nowMs);
+    if (enrBtn.update(digitalRead(PIN_BTN_ENROLL), nowMs)) {
+      enrPressed   = (enrBtn.stableState == LOW);
+      enrTriggered = false;
+      if (enrPressed) enrStart = nowMs;
+    }
+
+    if (enrPressed && !enrTriggered && ((nowMs - enrStart) >= ENROLL_BTN_HOLD_MS)) {
+      enrTriggered = true;
+      if (g_enrollCtx.state != ENROLL_IDLE) abortEnrollSession("BATAL TOMBOL", nowMs);
+      else                                  startEnrollSession(nowMs);
+    }
 
     if (g_enrollCtx.state != ENROLL_IDLE) stepEnrollSession(nowMs);
 
@@ -3084,16 +2778,11 @@ static void taskCommCore0(void* pvParameters) {
 
   unsigned long lastNavPollMs   = 0;
   unsigned long lastNotifPollMs = 0;
-  unsigned long lastDiagLogMs   = 0;
-  unsigned long lastStackChkMs  = 0;
 
   for (;;) {
     esp_task_wdt_reset();
     const unsigned long nowMs = millis();
 
-    checkStackWatermark("CommCore0", nowMs, lastStackChkMs);
-
-    serviceBootEnrollWebServer(nowMs);
     pollWatchOneShotScan(nowMs);
 
     const PageId activePage = getCurrentPageAtomic();
@@ -3117,19 +2806,6 @@ static void taskCommCore0(void* pvParameters) {
       if ((nowMs - lastNotifPollMs) >= NOTIF_POLL_MS) {
         lastNotifPollMs = nowMs;
         pollChronosNotification();
-      }
-    }
-
-    if ((nowMs - lastDiagLogMs) >= DIAG_LOG_MS) {
-      lastDiagLogMs = nowMs;
-      const uint32_t crcE = g_diagCrcErr.load(std::memory_order_relaxed);
-      const uint32_t macD = g_diagMacDrop.load(std::memory_order_relaxed);
-      const uint32_t txF  = g_diagTxFail.load(std::memory_order_relaxed);
-      if (crcE > 0 || macD > 0 || txF > 0) {
-        Serial.printf("[DIAG] CRC:%lu MAC:%lu TX:%lu\n",
-                      static_cast<unsigned long>(crcE),
-                      static_cast<unsigned long>(macD),
-                      static_cast<unsigned long>(txF));
       }
     }
 
@@ -3164,7 +2840,6 @@ static void taskDisplayLcdCore0(void* pvParameters) {
   unsigned long lastRtcReadMs    = 0;
   unsigned long lastCurveDrawMs  = 0;
   unsigned long lastTickerStepMs = 0;
-  unsigned long lastStackChkMs   = 0;
   int           homeTickerOffset = 0;
 
   BootState lastRenderedBoot    = static_cast<BootState>(255);
@@ -3189,8 +2864,6 @@ static void taskDisplayLcdCore0(void* pvParameters) {
   for (;;) {
     esp_task_wdt_reset();
     const unsigned long nowMs = millis();
-
-    checkStackWatermark("LcdUiCore0", nowMs, lastStackChkMs);
 
     if ((nowMs - lastRtcReadMs) >= RTC_READ_MS) {
       lastRtcReadMs = nowMs;
@@ -3447,16 +3120,13 @@ void setup() {
     pinMode(pin, INPUT_PULLUP);
   }
 
-  Serial.begin(115200);
-
   g_i2cMutex  = xSemaphoreCreateMutex();
   g_nvsMutex  = xSemaphoreCreateMutex();
   g_r503Mutex = xSemaphoreCreateMutex();
-  g_core0CmdQueue  = xQueueCreate(16, sizeof(Core0Command));
-  g_espNowRxQueue  = xQueueCreate(16, sizeof(EspNowRawFrame));
-  g_enrollCmdQueue = xQueueCreate(8, sizeof(EnrollCommand));
+  g_core0CmdQueue = xQueueCreate(16, sizeof(Core0Command));
+  g_espNowRxQueue = xQueueCreate(16, sizeof(EspNowRawFrame));
 
-  if (!g_i2cMutex || !g_nvsMutex || !g_r503Mutex || !g_core0CmdQueue || !g_espNowRxQueue || !g_enrollCmdQueue) {
+  if (!g_i2cMutex || !g_nvsMutex || !g_r503Mutex || !g_core0CmdQueue || !g_espNowRxQueue) {
     delay(1000);
     ESP.restart();
   }
@@ -3508,8 +3178,6 @@ void setup() {
   NimBLEDevice::init(BLE_DEVICE_NAME);
   watch.begin();
   watch.set24Hour(true);
-
-  startBootEnrollWebServer();
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   esp_task_wdt_config_t wdtCfg = {
